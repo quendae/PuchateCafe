@@ -22,18 +22,18 @@ window.addEventListener('unhandledrejection', (event) => {
   window.__bootstrapErrors.push('unhandledrejection :: ' + detail);
 });
 </script>`;
-const probeScript = `<script type="module">
-const report = (status, detail = '') => fetch('/__smoke?status=' + encodeURIComponent(status) + '&detail=' + encodeURIComponent(detail)).catch(() => {});
+const probeScript = `<script>
+const reportSmoke = (status, detail = '') => fetch('/__smoke?status=' + encodeURIComponent(status) + '&detail=' + encodeURIComponent(detail)).catch(() => {});
 window.setTimeout(() => {
   const button = document.querySelector('[data-action="solo"]');
-  if (!button) { report('fail', 'solo button missing'); return; }
+  if (!button) { reportSmoke('fail', 'solo button missing'); return; }
   button.click();
   window.setTimeout(() => {
     const setup = document.getElementById('setup-screen');
     const errors = (window.__bootstrapErrors || []).join(' | ');
-    report(setup && !setup.hidden ? 'ok' : 'fail', errors || 'setup screen stayed hidden after click');
-  }, 150);
-}, 300);
+    reportSmoke(setup && !setup.hidden ? 'ok' : 'fail', errors || 'setup screen stayed hidden after click');
+  }, 200);
+}, 800);
 </script>`;
 const smokeHtml = original.replace(
   '<script type="module" src="src/app.js"></script>',
@@ -94,7 +94,10 @@ chrome.stderr.on('data', (chunk) => { chromeStderr += chunk.toString(); });
 try {
   const result = await Promise.race([
     resultPromise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser smoke timed out. Chrome stderr: ${chromeStderr}`)), 15_000)),
+    new Promise((_, reject) => setTimeout(() => {
+      console.error('Browser request trace before timeout:\n' + requests.join('\n'));
+      reject(new Error(`Browser smoke timed out. Chrome stderr: ${chromeStderr}`));
+    }, 15_000)),
   ]);
   if (result.status !== 'ok') {
     console.error('Browser request trace:\n' + requests.join('\n'));
