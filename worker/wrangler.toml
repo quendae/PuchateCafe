@@ -1,6 +1,11 @@
 name = "puchate-cafe-signaling"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
+workers_dev = true
+
+routes = [
+  { pattern = "puchate.qqnd.fyi/api/*", zone_name = "qqnd.fyi" }
+]
 
 [durable_objects]
 bindings = [
@@ -10,4 +15,3 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SignalingRoom"]
-
