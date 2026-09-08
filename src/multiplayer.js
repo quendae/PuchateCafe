@@ -9,6 +9,7 @@
 export const PROTOCOL_VERSION = 1;
 export const MIN_SEATS = 2;
 export const MAX_SEATS = 8;
+export const BOT_DIFFICULTIES = Object.freeze(["easy", "normal", "hard"]);
 export const MESSAGE_TYPES = Object.freeze([
   "hello",
   "welcome",
@@ -25,6 +26,20 @@ const MESSAGE_TYPE_SET = new Set(MESSAGE_TYPES);
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_NAME_LENGTH = 24;
 const ROOM_CODE_PATTERN = /^[A-Z2-9]{6}$/;
+const DEFAULT_SIGNALING_KEY = "puchate-cafe-signaling-url";
+
+// Production follows the same deployment pattern as Skat: the signaling Worker
+// lives under /api on the game's own origin. Keep any user supplied override.
+if (typeof window !== "undefined" && typeof window.localStorage !== "undefined") {
+  try {
+    if (!window.localStorage.getItem(DEFAULT_SIGNALING_KEY)) {
+      window.localStorage.setItem(DEFAULT_SIGNALING_KEY, "/api");
+    }
+  } catch {
+    // Storage can be blocked in privacy modes; the advanced connection field
+    // remains available in the UI in that case.
+  }
+}
 
 export class ProtocolError extends Error {
   constructor(code, message) {
@@ -80,6 +95,14 @@ export function normalizePlayerName(value) {
   return name;
 }
 
+export function normalizeBotDifficulty(value) {
+  const difficulty = String(value ?? "normal").trim().toLowerCase();
+  if (!BOT_DIFFICULTIES.includes(difficulty)) {
+    fail("INVALID_LOBBY", `Bot difficulty must be one of: ${BOT_DIFFICULTIES.join(", ")}.`);
+  }
+  return difficulty;
+}
+
 export function validateSeatCount(value) {
   const count = Number(value);
   if (!Number.isInteger(count) || count < MIN_SEATS || count > MAX_SEATS) {
@@ -107,8 +130,9 @@ export function validateLobby(value) {
     if (entry.kind !== "empty" && !isShortString(entry.name, MAX_NAME_LENGTH)) {
       fail("INVALID_LOBBY", "Occupied seats require a valid name.");
     }
-    if (entry.kind === "bot" && entry.connected) {
-      fail("INVALID_LOBBY", "A bot seat cannot be marked as connected.");
+    if (entry.kind === "bot") {
+      if (entry.connected) fail("INVALID_LOBBY", "A bot seat cannot be marked as connected.");
+      normalizeBotDifficulty(entry.difficulty ?? "normal");
     }
   }
   const host = value.seats.find((seat) => seat.seat === 0);
@@ -156,6 +180,7 @@ export function parseProtocolMessage(raw) {
       break;
     case "start":
       if (!isRevision(message.revision)) fail("INVALID_MESSAGE", "Start revision is invalid.");
+      assertJsonSafe(message.payload ?? null, "start payload");
       break;
     case "action":
       if (!isShortString(message.action, 64) || !isShortString(message.actionId, 128) || !isRevision(message.revision)) {
@@ -295,6 +320,8 @@ export class MultiplayerSession {
     this.peerId = "";
     this.lobby = null;
     this.inGame = false;
+    this.paused = false;
+    this.pauseReason = null;
     this.revision = 0;
     this.lastRevision = -1;
     this.actionSequence = 0;
@@ -312,6 +339,8 @@ export class MultiplayerSession {
       localSeat: this.localSeat,
       localName: this.localName,
       inGame: this.inGame,
+      paused: this.paused,
+      pauseReason: this.pauseReason ? cloneJson(this.pauseReason) : null,
       revision: this.revision,
       lobby: this.lobby ? cloneJson(this.lobby) : null,
     });
@@ -368,14 +397,13 @@ export class MultiplayerSession {
         fail("INVALID_LOBBY", "Bot seat is outside the lobby.");
       }
       if (seats[spec.seat].kind === "human") fail("SEAT_IN_USE", "A connected player already occupies that seat.");
-      const difficulty = String(spec.difficulty ?? configuration.botDifficulty ?? "normal").slice(0, 24);
       seats[spec.seat] = {
         seat: spec.seat,
         kind: "bot",
         name: normalizePlayerName(spec.name ?? `Bot ${spec.seat}`),
         connected: false,
         ready: true,
-        difficulty,
+        difficulty: normalizeBotDifficulty(spec.difficulty ?? configuration.botDifficulty ?? "normal"),
       };
     }
     this.lobby = validateLobby({ maxSeats: nextCount, seats });
@@ -385,12 +413,36 @@ export class MultiplayerSession {
     return cloneJson(this.lobby);
   }
 
+  setBotSeat(seat, { name, difficulty = "normal" } = {}) {
+    this._requireHost("Only the host can configure bot seats.");
+    if (!Number.isInteger(seat) || seat <= 0 || seat >= this.lobby.maxSeats) {
+      fail("INVALID_LOBBY", "Bot seat is outside the lobby.");
+    }
+    const existing = this.lobby.seats[seat];
+    if (existing.kind === "human" && existing.connected) fail("SEAT_IN_USE", "A connected player already occupies that seat.");
+    const bots = this.lobby.seats
+      .filter((entry) => entry.kind === "bot" && entry.seat !== seat)
+      .map((entry) => ({ seat: entry.seat, name: entry.name, difficulty: entry.difficulty }));
+    bots.push({ seat, name: name ?? `Bot ${seat}`, difficulty });
+    return this.configureLobby({ maxSeats: this.lobby.maxSeats, bots });
+  }
+
+  clearBotSeat(seat) {
+    this._requireHost("Only the host can configure bot seats.");
+    const bots = this.lobby.seats
+      .filter((entry) => entry.kind === "bot" && entry.seat !== seat)
+      .map((entry) => ({ seat: entry.seat, name: entry.name, difficulty: entry.difficulty }));
+    return this.configureLobby({ maxSeats: this.lobby.maxSeats, bots });
+  }
+
   startGame(payload = undefined) {
     this._requireHost("Only the host can start the game.");
     if (this.inGame) fail("GAME_STARTED", "The game has already started.");
     const unready = this.lobby.seats.filter((seat) => seat.kind === "empty" || (seat.kind === "human" && !seat.connected));
     if (unready.length) fail("LOBBY_NOT_READY", "Every seat must contain a connected player or a bot.");
     this.inGame = true;
+    this.paused = false;
+    this.pauseReason = null;
     this.revision += 1;
     const message = { type: "start", revision: this.revision };
     if (payload !== undefined) {
@@ -402,8 +454,20 @@ export class MultiplayerSession {
     return this.revision;
   }
 
+  pauseGame({ code = "GAME_PAUSED", message = "The game is paused.", seat = null } = {}) {
+    this._requireHost("Only the host can pause the game.");
+    if (!this.inGame) return false;
+    if (this.paused) return true;
+    this.paused = true;
+    this.pauseReason = { code: String(code).slice(0, 64), message: String(message).slice(0, 240), seat };
+    this._broadcast({ type: "error", code: this.pauseReason.code, message: this.pauseReason.message });
+    this._emit("onConnection", { status: "game-paused", ...this.pauseReason });
+    return true;
+  }
+
   sendAction(action, payload = {}) {
     if (!this.inGame) fail("GAME_NOT_STARTED", "Actions can only be sent after the game starts.");
+    if (this.paused) fail("GAME_PAUSED", this.pauseReason?.message ?? "The game is paused.");
     if (!isShortString(action, 64)) fail("INVALID_ACTION", "Action name is invalid.");
     assertJsonSafe(payload, "action payload");
     const actionId = makeActionId(this.peerId || "local", ++this.actionSequence);
@@ -486,8 +550,11 @@ export class MultiplayerSession {
     this.peerId = "";
     this.lobby = null;
     this.inGame = false;
+    this.paused = false;
+    this.pauseReason = null;
     this.revision = 0;
     this.lastRevision = -1;
+    this.actionSequence = 0;
     this._seenActions.clear();
     this._actionOrigins.clear();
   }
@@ -548,6 +615,9 @@ export class MultiplayerSession {
     } else if (message.type === "peer-left" && this.role === "host") {
       this._removePeer(String(message.peerId));
     } else if (message.type === "host-left" && this.role === "guest") {
+      this.paused = true;
+      this.pauseReason = { code: "HOST_UNAVAILABLE", message: "The host left the room.", seat: 0 };
+      this._emit("onConnection", { status: "host-disconnected" });
       this._reportError(new ProtocolError("HOST_UNAVAILABLE", "The host left the room."));
     } else if (message.type === "error") {
       this._reportError(new ProtocolError(message.code ?? "SIGNALING_ERROR", message.message ?? "Signaling error."));
@@ -569,9 +639,7 @@ export class MultiplayerSession {
     if (signal.description) {
       if (this.role === "host" && signal.description.type === "offer") {
         let peer = this.peers.get(from);
-        if (!peer) {
-          peer = this._createHostPeer(from);
-        }
+        if (!peer) peer = this._createHostPeer(from);
         await peer.pc.setRemoteDescription(signal.description);
         peer.remoteDescriptionSet = true;
         await this._flushCandidates(peer);
@@ -587,8 +655,6 @@ export class MultiplayerSession {
       }
     } else if (signal.candidate) {
       let peer = this.role === "host" ? this.peers.get(from) : this.peers.get("host");
-      // ICE gathering may begin while setLocalDescription is still pending, so
-      // a candidate can legitimately reach the host just before its offer.
       if (!peer && this.role === "host") peer = this._createHostPeer(from);
       if (!peer) return;
       if (!peer.remoteDescriptionSet) peer.pendingCandidates.push(signal.candidate);
@@ -646,7 +712,11 @@ export class MultiplayerSession {
     addListener(channel, "message", (event) => this._handleChannelMessage(peer, event.data));
     addListener(channel, "close", () => {
       if (this.role === "host") this._removePeer(peer.id);
-      else this._emit("onConnection", { status: "host-disconnected" });
+      else {
+        this.paused = true;
+        this.pauseReason = { code: "HOST_UNAVAILABLE", message: "The host connection closed.", seat: 0 };
+        this._emit("onConnection", { status: "host-disconnected" });
+      }
     });
   }
 
@@ -715,6 +785,14 @@ export class MultiplayerSession {
       this._sendError(peer, "GAME_NOT_STARTED", "The game is not ready for actions.", message.actionId);
       return;
     }
+    if (this.paused) {
+      this._sendError(peer, "GAME_PAUSED", this.pauseReason?.message ?? "The game is paused.", message.actionId);
+      return;
+    }
+    if (message.revision > this.revision) {
+      this._sendError(peer, "INVALID_REVISION", "The action references a future state revision.", message.actionId);
+      return;
+    }
     if (this._seenActions.has(message.actionId)) {
       this._sendError(peer, "DUPLICATE_ACTION", "This action was already received.", message.actionId);
       return;
@@ -725,6 +803,16 @@ export class MultiplayerSession {
   }
 
   async _dispatchHostAction(request) {
+    if (this.paused) {
+      if (!request.local) {
+        this.resolveAction(request.actionId, false, null, {
+          peerId: request.peerId,
+          code: "GAME_PAUSED",
+          message: this.pauseReason?.message ?? "The game is paused.",
+        });
+      }
+      return;
+    }
     const handler = this.callbacks.onAction;
     if (typeof handler !== "function") {
       if (!request.local) this._sendError(this.peers.get(request.peerId), "NO_ACTION_HANDLER", "Host cannot process actions.", request.actionId);
@@ -775,6 +863,8 @@ export class MultiplayerSession {
       if (message.revision < this.revision) return;
       this.revision = message.revision;
       this.inGame = true;
+      this.paused = false;
+      this.pauseReason = null;
       this._emit("onStart", cloneJson(message), this.snapshot);
     } else if (message.type === "state") {
       if (message.revision <= this.lastRevision) return;
@@ -784,6 +874,11 @@ export class MultiplayerSession {
     } else if (message.type === "resolution") {
       this._emit("onResolution", cloneJson(message), { authoritative: false });
     } else if (message.type === "error") {
+      if (["PLAYER_DISCONNECTED", "GAME_PAUSED", "HOST_UNAVAILABLE"].includes(message.code)) {
+        this.paused = true;
+        this.pauseReason = { code: message.code, message: message.message, seat: null };
+        this._emit("onConnection", { status: "game-paused", ...this.pauseReason });
+      }
       this._reportError(new ProtocolError(message.code, message.message));
     }
   }
@@ -798,13 +893,27 @@ export class MultiplayerSession {
     if (!peer) return;
     this.peers.delete(peerId);
     try { peer.pc?.close(); } catch { /* best effort */ }
-    if (Number.isInteger(peer.seat) && this.lobby?.seats[peer.seat]?.kind === "human") {
-      this.lobby.seats[peer.seat] = emptySeat(peer.seat);
-      this.revision += 1;
-      if (!this.inGame) this._broadcast({ type: "lobby", lobby: this.lobby, revision: this.revision });
-      this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
+    const disconnectedSeat = Number.isInteger(peer.seat) ? peer.seat : null;
+    const occupied = disconnectedSeat !== null && this.lobby?.seats[disconnectedSeat]?.kind === "human";
+    if (occupied) {
+      if (this.inGame) {
+        const seat = this.lobby.seats[disconnectedSeat];
+        seat.connected = false;
+        seat.ready = false;
+        this.revision += 1;
+        this.pauseGame({
+          code: "PLAYER_DISCONNECTED",
+          message: `${seat.name || "A player"} lost the connection. The game is paused.`,
+          seat: disconnectedSeat,
+        });
+      } else {
+        this.lobby.seats[disconnectedSeat] = emptySeat(disconnectedSeat);
+        this.revision += 1;
+        this._broadcast({ type: "lobby", lobby: this.lobby, revision: this.revision });
+        this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
+      }
     }
-    this._emit("onPeerChange", { peerId, seat: peer.seat, status: "disconnected" });
+    this._emit("onPeerChange", { peerId, seat: disconnectedSeat, status: "disconnected" });
   }
 
   _relay(target, signal) {
