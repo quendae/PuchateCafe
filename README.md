@@ -9,8 +9,8 @@ Oryginalna, przeglądarkowa gra karciana o prowadzeniu kawiarni dla zwierzaków.
 - lokalna gra z botami na poziomie łatwym lub normalnym,
 - jednoczesny wybór kart, przekazywanie rąk i automatyczna punktacja,
 - komplet mechanicznych odpowiedników kart z *Sushi Go!* i *Sushi Go Party!*,
-- prywatny multiplayer host-authoritative przez WebRTC DataChannel,
-- osobny Cloudflare Worker do sygnalizacji pokoi,
+- prywatny multiplayer host-authoritative przez wspólny `qqnd-game-server`,
+- wspólne sesje, pokoje, reconnect i routing akcji pod `api.qqnd.fyi`,
 - responsywny stół, obsługa dotyku, ograniczenie animacji i czytelność bez polegania wyłącznie na kolorze,
 - animowane rozdawanie, odkrywanie i podsumowania oraz proceduralne efekty dźwiękowe z wyciszeniem,
 - 27 oryginalnych ilustracji kart w miękkim, trójwymiarowym stylu — bez cudzych grafik.
@@ -33,16 +33,17 @@ npm run build
 
 ## Multiplayer
 
-Gra działa offline bez serwera. Sieć jest inicjalizowana dopiero po otwarciu trybu multiplayer.
+Gra lokalna nadal działa całkowicie offline. Po otwarciu multiplayera klient łączy się przez WebSocket ze wspólnym backendem QQND:
 
-1. Wdróż katalog `worker/` jako Cloudflare Worker z Durable Object.
-2. Skopiuj adres `wss://…` Workera do pola „Adres serwera pokoju”.
-3. Host tworzy sześcioliterowy kod, a pozostali gracze dołączają nim do pokoju.
-4. Po zestawieniu WebRTC cała rozgrywka płynie bezpośrednio między przeglądarkami.
+```text
+wss://api.qqnd.fyi/api/v1/ws
+```
 
-Host posiada jedyny pełny stan gry. Goście wysyłają wyłącznie intencje, a każdy otrzymuje osobny widok bez cudzych rąk, zakrytych wyborów, kolejności talii ani ziarna losowania. Jest to model do prywatnych gier znajomych; host technicznie może podejrzeć stan w narzędziach deweloperskich.
+Nie ma osobnego Cloudflare Workera, SDP/ICE ani połączeń WebRTC pomiędzy graczami. Host tworzy prywatny pokój z kodem `XXXX-XXXX`, a pozostali gracze dołączają przez `qqnd-game-server`.
 
-Do połączeń przez restrykcyjny NAT należy dodać własny serwer TURN w konfiguracji klienta. Publiczny STUN nie gwarantuje połączenia każdej pary urządzeń.
+Na obecnym etapie backend odpowiada za sesje, lobby, numerację miejsc, routing akcji, reconnect i snapshoty. Host przeglądarkowy nadal wykonuje reguły gry i posiada pełny stan; po każdej zmianie zapisuje pełny snapshot na serwerze i publikuje osobny `getPlayerView(state, seat)` dla każdego gościa. Dzięki temu inni gracze nie otrzymują cudzych rąk, kolejności talii, seeda ani RNG.
+
+Szczegóły wdrożenia i modelu migracji znajdują się w [DEPLOY_MULTIPLAYER.md](DEPLOY_MULTIPLAYER.md). Backend jest rozwijany w `quendae/qqnd-game-server` pod Game ID `puchate`.
 
 ## Architektura
 
@@ -55,8 +56,7 @@ src/ui.js           bezpieczne renderowanie komponentów DOM
 src/sound.js        proceduralne efekty Web Audio
 src/art.js          mapa oryginalnych ilustracji rastrowych kart
 assets/cards/       zoptymalizowane ilustracje WebP
-src/multiplayer.js  WebRTC, protokół i autorytet hosta
-worker/             signaling WebSocket / Durable Object
+src/multiplayer.js  klient wspólnego qqnd-game-server
 tests/              testy reguł, prywatności i protokołu
 ```
 
