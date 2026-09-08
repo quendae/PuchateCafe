@@ -718,10 +718,11 @@ export class MultiplayerSession {
 
   _syncRoom(room) {
     if (!room || room.game !== GAME_ID) return;
+    const runtimeHostSessionId = this.inGame && this.hostSessionId ? this.hostSessionId : '';
     this.roomObj = cloneJson(room);
     this.roomCode = normalizeRoomCode(room.id);
     this.maxSeats = validateSeatCount(room.maxPlayers ?? this.maxSeats ?? MAX_SEATS);
-    this.hostSessionId = String(room.ownerSessionId ?? this.hostSessionId);
+    this.hostSessionId = runtimeHostSessionId || String(room.ownerSessionId ?? this.hostSessionId);
     this.localSeat = this.session ? (room.players ?? []).findIndex((player) => player.id === this.session.id) : this.localSeat;
     this.role = this.session?.id === this.hostSessionId ? 'host' : 'guest';
     if (room.status === 'in_game') this.inGame = true;
