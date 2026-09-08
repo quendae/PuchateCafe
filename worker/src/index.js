@@ -1,5 +1,5 @@
 const ROOM_TTL_MS = 2 * 60 * 60 * 1000;
-const MAX_GUESTS = 4;
+const MAX_GUESTS = 7; // host + seven guests = the eight-seat Party table
 const MAX_SIGNAL_BYTES = 64 * 1024;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -39,6 +39,11 @@ function safeSend(socket, message) {
 
 function attachment(socket) {
   try { return socket.deserializeAttachment() ?? {}; } catch { return {}; }
+}
+
+export function normalizeApiPath(pathname) {
+  if (pathname === "/api") return "/";
+  return pathname.startsWith("/api/") ? pathname.slice(4) : pathname;
 }
 
 /**
@@ -176,16 +181,19 @@ export class SignalingRoom {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/health") return json({ ok: true });
+    const path = normalizeApiPath(url.pathname);
+    if (path === "/health") {
+      return json({ ok: true, service: "puchate-cafe-signaling", maxGuests: MAX_GUESTS });
+    }
     if (!isWebSocketRequest(request)) return errorResponse("UPGRADE_REQUIRED", "Use a WebSocket connection.", 426);
 
     let code;
     let role;
-    if (url.pathname === "/room/create") {
+    if (path === "/room/create") {
       code = roomCode();
       role = "host";
     } else {
-      const match = url.pathname.match(/^\/room\/([A-Z2-9]{6})\/join$/i);
+      const match = path.match(/^\/room\/([A-Z2-9]{6})\/join$/i);
       if (!match) return errorResponse("NOT_FOUND", "Unknown endpoint.", 404);
       code = match[1].toUpperCase();
       role = "guest";
