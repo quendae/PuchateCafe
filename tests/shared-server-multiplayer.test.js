@@ -234,3 +234,67 @@ test('Puchate host turns a takeover seat into a bot, executes its move, and repu
   assert.equal(env.socket.sent.filter((frame) => frame.type === 'game.state.commit').length, commitsBefore + 1, 'host must persist the state after bot takeover');
   assert.ok(env.peers.some((event) => event.status === 'bot-takeover' && event.seat === 1), 'client should expose takeover to the UI');
 });
+
+test('a migrated Puchate host keeps runtime host authority across later room.updated frames', async () => {
+  const env = setup({ filterState: (state, seat) => getPlayerView(state, seat) });
+  await env.session.createRoom({ name: 'Maja', maxSeats: 2 });
+  await addGuest(env);
+  await env.session.startGame();
+
+  const canonical = createGame({
+    seed: 'shared-server-host-migration',
+    players: [
+      { id: 'host', name: 'Maja', kind: 'human' },
+      { id: 'guest', name: 'Olek', kind: 'human' },
+    ],
+  });
+
+  // Recast this transport as the surviving guest, matching the state of a real
+  // guest session immediately before the server promotes it to browser host.
+  env.session.session = { id: GUEST_ID, nickname: 'Olek', connected: true };
+  env.session.localSeat = 1;
+  env.session.role = 'guest';
+  env.session.authoritativeState = null;
+
+  env.socket.server({
+    type: 'game.player.bot_takeover',
+    roomId: 'CAFE-2345',
+    sessionId: HOST_ID,
+    seat: 0,
+    nickname: 'Maja',
+    botSeats: [0],
+    hostSessionId: GUEST_ID,
+    authoritative: false,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(env.socket.sent.some((frame) => frame.type === 'game.state.get'), 'new browser host must request the canonical server snapshot');
+
+  env.socket.server({
+    type: 'game.state',
+    roomId: 'CAFE-2345',
+    revision: 1,
+    botSeats: [0],
+    hostSessionId: GUEST_ID,
+    authoritative: false,
+    viewerSeat: 1,
+    state: canonical,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(env.session.role, 'host');
+  assert.equal(env.session.authoritativeState.players[0].kind, 'bot');
+
+  env.socket.room = {
+    ...env.socket.room,
+    status: 'in_game',
+    ownerSessionId: HOST_ID,
+    players: [
+      { id: HOST_ID, nickname: 'Maja', connected: false },
+      { id: GUEST_ID, nickname: 'Olek', connected: true },
+    ],
+  };
+  env.socket.server({ type: 'room.updated', room: env.socket.room });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(env.session.hostSessionId, GUEST_ID, 'lobby owner must not overwrite the migrated runtime host during a game');
+  assert.equal(env.session.role, 'host', 'surviving player must keep browser-host authority after room presence updates');
+});
