@@ -8,8 +8,19 @@ const smokePath = 'browser-smoke.html';
 const original = await readFile('index.html', 'utf8');
 const bootstrapScript = `<script>
 window.__bootstrapErrors = [];
-window.addEventListener('error', (event) => window.__bootstrapErrors.push(event.message || 'window error'));
-window.addEventListener('unhandledrejection', (event) => window.__bootstrapErrors.push(String(event.reason?.message || event.reason || 'unhandled rejection')));
+const recordBootstrapError = (event) => {
+  const target = event.target && event.target !== window ? event.target : null;
+  const resource = target ? (target.src || target.href || target.tagName || 'resource') : '';
+  const source = event.filename ? event.filename + ':' + event.lineno + ':' + event.colno : '';
+  const stack = event.error && event.error.stack ? event.error.stack : '';
+  window.__bootstrapErrors.push([event.message || 'window error', source, resource, stack].filter(Boolean).join(' :: '));
+};
+window.addEventListener('error', recordBootstrapError, true);
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason;
+  const detail = reason && reason.stack ? reason.stack : String(reason && reason.message || reason || 'unhandled rejection');
+  window.__bootstrapErrors.push('unhandledrejection :: ' + detail);
+});
 </script>`;
 const probeScript = `<script type="module">
 const report = (status, detail = '') => fetch('/__smoke?status=' + encodeURIComponent(status) + '&detail=' + encodeURIComponent(detail)).catch(() => {});
@@ -21,8 +32,8 @@ window.setTimeout(() => {
     const setup = document.getElementById('setup-screen');
     const errors = (window.__bootstrapErrors || []).join(' | ');
     report(setup && !setup.hidden ? 'ok' : 'fail', errors || 'setup screen stayed hidden after click');
-  }, 100);
-}, 200);
+  }, 150);
+}, 300);
 </script>`;
 const smokeHtml = original.replace(
   '<script type="module" src="src/app.js"></script>',
@@ -33,6 +44,7 @@ await writeFile(smokePath, smokeHtml, 'utf8');
 
 let resolveResult;
 const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+const requests = [];
 const mimeTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
@@ -49,9 +61,12 @@ const server = createServer(async (request, response) => {
   try {
     if ((await stat(filePath)).isDirectory()) filePath = join(filePath, 'index.html');
     const body = await readFile(filePath);
-    response.writeHead(200, { 'Content-Type': mimeTypes[extname(filePath)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
+    const type = mimeTypes[extname(filePath)] || 'application/octet-stream';
+    requests.push(`${url.pathname} -> 200 ${type}`);
+    response.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' });
     response.end(body);
   } catch {
+    requests.push(`${url.pathname} -> 404`);
     response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     response.end('Not found');
   }
@@ -81,7 +96,10 @@ try {
     resultPromise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Browser smoke timed out. Chrome stderr: ${chromeStderr}`)), 15_000)),
   ]);
-  if (result.status !== 'ok') throw new Error(`Browser smoke failed: ${result.detail || 'unknown bootstrap failure'}`);
+  if (result.status !== 'ok') {
+    console.error('Browser request trace:\n' + requests.join('\n'));
+    throw new Error(`Browser smoke failed: ${result.detail || 'unknown bootstrap failure'}`);
+  }
   console.log('Browser smoke OK: app bootstrapped and Solo menu button opened setup.');
 } finally {
   chrome.kill('SIGKILL');
