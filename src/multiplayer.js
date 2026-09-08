@@ -1,48 +1,26 @@
 /**
- * Host-authoritative WebRTC multiplayer for Puchate Cafe.
+ * Shared QQND multiplayer transport for Puchate Café.
  *
- * The signaling service only forwards SDP/ICE. Once connected, every guest has
- * one reliable, ordered DataChannel to the host. Guests send intents; only the
- * host's game engine may change authoritative state.
+ * Sessions, rooms, reconnect, action routing and reconnect snapshots live on
+ * qqnd-game-server. Until the Puchate rules reducer is moved server-side, the
+ * current room host remains the only browser allowed to mutate canonical game
+ * state and publishes a separate filtered projection for every remote human.
  */
 
 export const PROTOCOL_VERSION = 1;
 export const MIN_SEATS = 2;
 export const MAX_SEATS = 8;
 export const BOT_DIFFICULTIES = Object.freeze(["easy", "normal", "hard"]);
-export const MESSAGE_TYPES = Object.freeze([
-  "hello",
-  "welcome",
-  "lobby",
-  "start",
-  "action",
-  "state",
-  "resolution",
-  "error",
-  "ping",
-]);
+export const DEFAULT_SERVER_URL = "wss://api.qqnd.fyi/api/v1/ws";
 
-const MESSAGE_TYPE_SET = new Set(MESSAGE_TYPES);
-const MAX_MESSAGE_BYTES = 256 * 1024;
-const MAX_NAME_LENGTH = 24;
-const ROOM_CODE_PATTERN = /^[A-Z2-9]{6}$/;
-const DEFAULT_SIGNALING_KEY = "puchate-cafe-signaling-url";
-
-// Production follows the same deployment pattern as Skat: the signaling Worker
-// lives under /api on the game's own origin. Keep any user supplied override.
-if (typeof window !== "undefined" && typeof window.localStorage !== "undefined") {
-  try {
-    if (!window.localStorage.getItem(DEFAULT_SIGNALING_KEY)) {
-      window.localStorage.setItem(DEFAULT_SIGNALING_KEY, "/api");
-    }
-  } catch {
-    // Storage can be blocked in privacy modes; the advanced connection field
-    // remains available in the UI in that case.
-  }
-}
+const GAME_ID = "puchate";
+const SESSION_STORAGE_KEY = "puchate.qqnd.server-session.v1";
+const MAX_NAME_LENGTH = 20;
+const REQUEST_TIMEOUT_MS = 12_000;
+const ROOM_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{8}$/;
 
 export class ProtocolError extends Error {
-  constructor(code, message) {
+  constructor(code, message = code) {
     super(message);
     this.name = "ProtocolError";
     this.code = code;
@@ -53,201 +31,21 @@ function fail(code, message) {
   throw new ProtocolError(code, message);
 }
 
+function cloneJson(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function isRevision(value) {
-  return Number.isSafeInteger(value) && value >= 0;
-}
-
-function isShortString(value, max = 80) {
-  return typeof value === "string" && value.length > 0 && value.length <= max;
-}
-
-function assertJsonSafe(value, label = "payload") {
-  try {
-    const json = JSON.stringify(value);
-    if (json === undefined) fail("INVALID_MESSAGE", `${label} is not JSON serializable.`);
-    if (new TextEncoder().encode(json).byteLength > MAX_MESSAGE_BYTES) {
-      fail("MESSAGE_TOO_LARGE", `${label} exceeds ${MAX_MESSAGE_BYTES} bytes.`);
-    }
-  } catch (error) {
-    if (error instanceof ProtocolError) throw error;
-    fail("INVALID_MESSAGE", `${label} is not JSON serializable.`);
-  }
-}
-
-export function normalizeRoomCode(value) {
-  const code = String(value ?? "").trim().toUpperCase().replace(/[\s-]/g, "");
-  if (!ROOM_CODE_PATTERN.test(code)) {
-    fail("INVALID_ROOM", "Room code must contain six letters or digits (without 0, 1, I or O).");
-  }
-  return code;
-}
-
-export function normalizePlayerName(value) {
-  const name = String(value ?? "").trim().replace(/\s+/g, " ");
-  if (!name) fail("INVALID_NAME", "Player name cannot be empty.");
-  if (name.length > MAX_NAME_LENGTH) {
-    fail("INVALID_NAME", `Player name may contain at most ${MAX_NAME_LENGTH} characters.`);
-  }
-  return name;
-}
-
-export function normalizeBotDifficulty(value) {
-  const difficulty = String(value ?? "normal").trim().toLowerCase();
-  if (!BOT_DIFFICULTIES.includes(difficulty)) {
-    fail("INVALID_LOBBY", `Bot difficulty must be one of: ${BOT_DIFFICULTIES.join(", ")}.`);
-  }
-  return difficulty;
-}
-
-export function validateSeatCount(value) {
-  const count = Number(value);
-  if (!Number.isInteger(count) || count < MIN_SEATS || count > MAX_SEATS) {
-    fail("INVALID_LOBBY", `A room must have between ${MIN_SEATS} and ${MAX_SEATS} seats.`);
-  }
-  return count;
-}
-
-export function validateLobby(value) {
-  if (!isRecord(value)) fail("INVALID_LOBBY", "Lobby must be an object.");
-  const maxSeats = validateSeatCount(value.maxSeats);
-  if (!Array.isArray(value.seats) || value.seats.length !== maxSeats) {
-    fail("INVALID_LOBBY", "Lobby must describe every seat exactly once.");
-  }
-  const seen = new Set();
-  for (const entry of value.seats) {
-    if (!isRecord(entry) || !Number.isInteger(entry.seat) || entry.seat < 0 || entry.seat >= maxSeats) {
-      fail("INVALID_LOBBY", "Lobby contains an invalid seat.");
-    }
-    if (seen.has(entry.seat)) fail("INVALID_LOBBY", "Lobby contains a duplicate seat.");
-    seen.add(entry.seat);
-    if (!["human", "bot", "empty"].includes(entry.kind)) {
-      fail("INVALID_LOBBY", "Seat kind must be human, bot or empty.");
-    }
-    if (entry.kind !== "empty" && !isShortString(entry.name, MAX_NAME_LENGTH)) {
-      fail("INVALID_LOBBY", "Occupied seats require a valid name.");
-    }
-    if (entry.kind === "bot") {
-      if (entry.connected) fail("INVALID_LOBBY", "A bot seat cannot be marked as connected.");
-      normalizeBotDifficulty(entry.difficulty ?? "normal");
-    }
-  }
-  const host = value.seats.find((seat) => seat.seat === 0);
-  if (!host || host.kind !== "human" || !host.connected) {
-    fail("INVALID_LOBBY", "Seat zero must be the connected host.");
-  }
-  assertJsonSafe(value, "lobby");
-  return value;
-}
-
-/** Parse and validate an application-level DataChannel packet. */
-export function parseProtocolMessage(raw) {
-  let message = raw;
-  if (typeof raw === "string") {
-    if (new TextEncoder().encode(raw).byteLength > MAX_MESSAGE_BYTES) {
-      fail("MESSAGE_TOO_LARGE", "Message is too large.");
-    }
-    try {
-      message = JSON.parse(raw);
-    } catch {
-      fail("INVALID_JSON", "Message is not valid JSON.");
-    }
-  }
-  if (!isRecord(message) || !MESSAGE_TYPE_SET.has(message.type)) {
-    fail("INVALID_MESSAGE", "Unknown or missing message type.");
-  }
-
-  switch (message.type) {
-    case "hello":
-      if (message.protocol !== PROTOCOL_VERSION || !isShortString(message.name, MAX_NAME_LENGTH)) {
-        fail("PROTOCOL_MISMATCH", "Invalid hello packet or incompatible protocol.");
-      }
-      break;
-    case "welcome":
-      if (message.protocol !== PROTOCOL_VERSION || !Number.isInteger(message.seat) || message.seat < 1 || message.seat >= MAX_SEATS) {
-        fail("INVALID_MESSAGE", "Invalid welcome packet.");
-      }
-      validateLobby(message.lobby);
-      if (message.seat >= message.lobby.maxSeats) fail("INVALID_MESSAGE", "Welcome seat is outside the lobby.");
-      if (!isRevision(message.revision)) fail("INVALID_MESSAGE", "Welcome revision is invalid.");
-      break;
-    case "lobby":
-      validateLobby(message.lobby);
-      if (!isRevision(message.revision)) fail("INVALID_MESSAGE", "Lobby revision is invalid.");
-      break;
-    case "start":
-      if (!isRevision(message.revision)) fail("INVALID_MESSAGE", "Start revision is invalid.");
-      assertJsonSafe(message.payload ?? null, "start payload");
-      break;
-    case "action":
-      if (!isShortString(message.action, 64) || !isShortString(message.actionId, 128) || !isRevision(message.revision)) {
-        fail("INVALID_ACTION", "Action packet is incomplete.");
-      }
-      assertJsonSafe(message.payload ?? null, "action payload");
-      break;
-    case "state":
-      if (!isRevision(message.revision)) fail("INVALID_MESSAGE", "State revision is invalid.");
-      assertJsonSafe(message.state, "state");
-      break;
-    case "resolution":
-      if (!isShortString(message.actionId, 128) || typeof message.ok !== "boolean" || !isRevision(message.revision)) {
-        fail("INVALID_MESSAGE", "Resolution packet is incomplete.");
-      }
-      if (!message.ok && (!isRecord(message.error) || !isShortString(message.error.code, 64))) {
-        fail("INVALID_MESSAGE", "Rejected resolutions require an error code.");
-      }
-      assertJsonSafe(message.result ?? message.error ?? null, "resolution");
-      break;
-    case "error":
-      if (!isShortString(message.code, 64) || !isShortString(message.message, 240)) {
-        fail("INVALID_MESSAGE", "Error packet is incomplete.");
-      }
-      break;
-    case "ping":
-      if (!Number.isFinite(message.at) || (message.reply !== undefined && typeof message.reply !== "boolean")) {
-        fail("INVALID_MESSAGE", "Ping packet is invalid.");
-      }
-      break;
-  }
-  assertJsonSafe(message, "message");
-  return message;
-}
-
-export function encodeProtocolMessage(message) {
-  return JSON.stringify(parseProtocolMessage(message));
-}
-
-export function makeActionId(peerId = "local", sequence = 0) {
-  const safePeer = String(peerId).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "local";
-  if (!Number.isSafeInteger(sequence) || sequence < 0) fail("INVALID_ACTION", "Action sequence is invalid.");
-  return `${safePeer}:${sequence}`;
-}
-
-function cloneJson(value) {
-  assertJsonSafe(value);
-  return JSON.parse(JSON.stringify(value));
-}
-
-function emptySeat(seat) {
-  return { seat, kind: "empty", name: "", connected: false, ready: false };
-}
-
-function createLobby(name, maxSeats) {
-  const seats = Array.from({ length: maxSeats }, (_, seat) => emptySeat(seat));
-  seats[0] = { seat: 0, kind: "human", name, connected: true, ready: true };
-  return { maxSeats, seats };
-}
-
 function addListener(target, event, listener) {
-  if (typeof target.addEventListener === "function") {
+  if (typeof target?.addEventListener === "function") {
     target.addEventListener(event, listener);
     return () => target.removeEventListener?.(event, listener);
   }
   const property = `on${event}`;
-  const previous = target[property];
+  const previous = target?.[property];
   const wrapped = (...args) => {
     if (typeof previous === "function") previous(...args);
     listener(...args);
@@ -259,77 +57,110 @@ function addListener(target, event, listener) {
 }
 
 function socketOpen(socket) {
-  return socket?.readyState === 1 || socket?.readyState === socket?.OPEN;
+  return socket?.readyState === 1;
 }
 
-function channelOpen(channel) {
-  return channel?.readyState === "open";
+function defaultStorage() {
+  try {
+    return globalThis.localStorage ?? null;
+  } catch {
+    return null;
+  }
 }
 
-function websocketUrl(base, path) {
-  const fallback = typeof location !== "undefined" ? location.href : undefined;
+function normalizeServerUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw === "/api") return DEFAULT_SERVER_URL;
   let url;
   try {
-    url = new URL(base, fallback);
+    url = new URL(raw, typeof location !== "undefined" ? location.href : undefined);
   } catch {
-    fail("INVALID_SIGNALING_URL", "A valid signaling WebSocket URL is required.");
+    fail("INVALID_SERVER_URL", "Nieprawidłowy adres wspólnego serwera multiplayer.");
   }
   if (url.protocol === "http:") url.protocol = "ws:";
   if (url.protocol === "https:") url.protocol = "wss:";
-  if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-    fail("INVALID_SIGNALING_URL", "Signaling URL must use ws, wss, http or https.");
+  if (!["ws:", "wss:"].includes(url.protocol)) {
+    fail("INVALID_SERVER_URL", "Serwer multiplayer musi używać WebSocket (ws/wss).");
   }
-  const prefix = url.pathname.replace(/\/$/, "");
-  url.pathname = `${prefix}${path}`;
+  if (!url.pathname || url.pathname === "/") url.pathname = "/api/v1/ws";
   url.search = "";
   url.hash = "";
   return url.toString();
 }
 
-function defaultId() {
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+export function normalizeRoomCode(value) {
+  const raw = String(value ?? "").trim().toUpperCase().replace(/[^A-Z2-9]/g, "");
+  if (!ROOM_CODE_PATTERN.test(raw)) {
+    fail("INVALID_ROOM", "Kod pokoju powinien mieć osiem znaków.");
+  }
+  return `${raw.slice(0, 4)}-${raw.slice(4)}`;
 }
 
-/**
- * @typedef {object} MultiplayerOptions
- * @property {string} signalingUrl Base URL of the signaling Worker.
- * @property {(state: any, seat: number, meta: object) => any} filterState
- * Required host callback. It must return only information legally visible to
- * `seat`; the networking layer never guesses a card game's hidden information.
- */
+export function normalizePlayerName(value) {
+  const name = String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ");
+  if (name.length < 2) fail("INVALID_NAME", "Imię musi mieć co najmniej dwa znaki.");
+  if (name.length > MAX_NAME_LENGTH) fail("INVALID_NAME", `Imię może mieć maksymalnie ${MAX_NAME_LENGTH} znaków.`);
+  if (!/^[\p{L}\p{N} _-]+$/u.test(name)) fail("INVALID_NAME", "Imię zawiera niedozwolone znaki.");
+  return name;
+}
+
+export function normalizeBotDifficulty(value) {
+  const difficulty = String(value ?? "normal").trim().toLowerCase();
+  if (!BOT_DIFFICULTIES.includes(difficulty)) {
+    fail("INVALID_LOBBY", `Poziom bota musi być jednym z: ${BOT_DIFFICULTIES.join(", ")}.`);
+  }
+  return difficulty;
+}
+
+export function validateSeatCount(value) {
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < MIN_SEATS || count > MAX_SEATS) {
+    fail("INVALID_LOBBY", `Stolik musi mieć od ${MIN_SEATS} do ${MAX_SEATS} miejsc.`);
+  }
+  return count;
+}
+
+function emptySeat(seat) {
+  return { seat, kind: "empty", name: "", connected: false, ready: false };
+}
 
 export class MultiplayerSession {
   constructor(options = {}) {
-    this.signalingUrl = options.signalingUrl ?? "";
-    this.rtcConfig = options.rtcConfig ?? { iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] };
+    this.serverUrl = normalizeServerUrl(options.serverUrl ?? options.signalingUrl ?? DEFAULT_SERVER_URL);
     this.webSocketFactory = options.webSocketFactory ?? ((url) => new WebSocket(url));
-    this.peerConnectionFactory = options.peerConnectionFactory ?? ((config) => new RTCPeerConnection(config));
     this.filterState = options.filterState ?? options.stateForSeat ?? null;
+    this.storage = options.storage === undefined ? defaultStorage() : options.storage;
     this.now = options.now ?? (() => Date.now());
-    this.idFactory = options.idFactory ?? defaultId;
     this.callbacks = { ...(options.callbacks ?? {}) };
     for (const name of ["onLobby", "onStart", "onAction", "onState", "onResolution", "onError", "onConnection", "onPeerChange"]) {
       if (typeof options[name] === "function") this.callbacks[name] = options[name];
     }
 
-    this.role = null;
+    this.socket = null;
+    this.socketPromise = null;
+    this.waiters = [];
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this._closing = false;
+
+    this.session = null;
+    this.resumeToken = "";
+    this.roomObj = null;
     this.roomCode = "";
-    this.localSeat = null;
     this.localName = "";
-    this.peerId = "";
+    this.localSeat = null;
+    this.hostSessionId = "";
+    this.role = null;
     this.lobby = null;
+    this.maxSeats = 3;
+    this.botSpecs = [];
+    this.botSeats = [];
     this.inGame = false;
     this.paused = false;
     this.pauseReason = null;
     this.revision = 0;
     this.lastRevision = -1;
     this.actionSequence = 0;
-    this.peers = new Map();
-    this.signalSocket = null;
-    this._seenActions = new Set();
-    this._actionOrigins = new Map();
-    this._closing = false;
   }
 
   get snapshot() {
@@ -340,621 +171,621 @@ export class MultiplayerSession {
       localName: this.localName,
       inGame: this.inGame,
       paused: this.paused,
-      pauseReason: this.pauseReason ? cloneJson(this.pauseReason) : null,
+      pauseReason: cloneJson(this.pauseReason),
       revision: this.revision,
-      lobby: this.lobby ? cloneJson(this.lobby) : null,
+      lobby: cloneJson(this.lobby),
+      sessionId: this.session?.id ?? null,
     });
   }
 
   async createRoom({ name = "Gospodarz", maxSeats = 3 } = {}) {
-    this.close();
+    await this._leaveCurrentRoom();
     this._closing = false;
-    this.role = "host";
-    this.localSeat = 0;
     this.localName = normalizePlayerName(name);
-    this.lobby = createLobby(this.localName, validateSeatCount(maxSeats));
-    const ready = await this._openSignal("/room/create", "created");
-    this.roomCode = normalizeRoomCode(ready.roomCode);
-    this.peerId = String(ready.peerId ?? "host");
-    this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
+    this.maxSeats = validateSeatCount(maxSeats);
+    await this._ensureSession(this.localName);
+
+    const response = await this._request({
+      type: "room.create",
+      game: GAME_ID,
+      name: "Puchate Café",
+      visibility: "private",
+      maxPlayers: this.maxSeats,
+    }, ["room.created"]);
+    this._syncRoom(response.room);
     this._emit("onConnection", { status: "room-created", roomCode: this.roomCode });
-    return { roomCode: this.roomCode, seat: 0, lobby: cloneJson(this.lobby) };
+    return { roomCode: this.roomCode, seat: this.localSeat, lobby: cloneJson(this.lobby) };
   }
 
   async joinRoom(roomCode, { name = "Gość" } = {}) {
-    this.close();
+    await this._leaveCurrentRoom();
     this._closing = false;
-    this.role = "guest";
     this.localName = normalizePlayerName(name);
-    this.roomCode = normalizeRoomCode(roomCode);
-    const ready = await this._openSignal(`/room/${encodeURIComponent(this.roomCode)}/join`, "joined");
-    this.peerId = String(ready.peerId);
-    await this._createGuestOffer();
-    this._emit("onConnection", { status: "signaling-connected", roomCode: this.roomCode });
-    return { roomCode: this.roomCode };
+    const normalized = normalizeRoomCode(roomCode);
+    await this._ensureSession(this.localName);
+    const response = await this._request({ type: "room.join", roomId: normalized }, ["room.joined"]);
+    this._syncRoom(response.room);
+    this._emit("onConnection", { status: "connected", roomCode: this.roomCode, seat: this.localSeat });
+    return { roomCode: this.roomCode, seat: this.localSeat, lobby: cloneJson(this.lobby) };
   }
 
   configureLobby(configuration = {}) {
-    this._requireHost("Only the host can configure the lobby.");
-    if (this.inGame) fail("GAME_STARTED", "The lobby cannot be changed after the game starts.");
-    const nextCount = configuration.maxSeats === undefined
-      ? this.lobby.maxSeats
-      : validateSeatCount(configuration.maxSeats);
-    const occupiedHumans = this.lobby.seats.filter((seat) => seat.kind === "human" && seat.connected);
-    if (occupiedHumans.some((seat) => seat.seat >= nextCount)) {
-      fail("SEAT_IN_USE", "Cannot remove a seat occupied by a connected player.");
+    this._requireHost("Tylko gospodarz może konfigurować stolik.");
+    if (this.inGame) fail("GAME_STARTED", "Nie można zmieniać miejsc po rozpoczęciu gry.");
+    if (configuration.maxSeats !== undefined && Number(configuration.maxSeats) !== this.maxSeats) {
+      fail("INVALID_LOBBY", "Liczby miejsc nie można zmienić po utworzeniu pokoju.");
     }
-
-    const seats = Array.from({ length: nextCount }, (_, seat) => emptySeat(seat));
-    for (const human of occupiedHumans) seats[human.seat] = { ...human };
-    const requestedBots = configuration.bots ?? configuration.botSeats ?? this.lobby.seats
-      .filter((seat) => seat.kind === "bot")
-      .map((seat) => ({ seat: seat.seat, name: seat.name, difficulty: seat.difficulty }));
-    if (!Array.isArray(requestedBots)) fail("INVALID_LOBBY", "bots must be an array.");
-    for (const item of requestedBots) {
-      const spec = Number.isInteger(item) ? { seat: item } : item;
-      if (!isRecord(spec) || !Number.isInteger(spec.seat) || spec.seat <= 0 || spec.seat >= nextCount) {
-        fail("INVALID_LOBBY", "Bot seat is outside the lobby.");
-      }
-      if (seats[spec.seat].kind === "human") fail("SEAT_IN_USE", "A connected player already occupies that seat.");
-      seats[spec.seat] = {
-        seat: spec.seat,
-        kind: "bot",
-        name: normalizePlayerName(spec.name ?? `Bot ${spec.seat}`),
-        connected: false,
-        ready: true,
-        difficulty: normalizeBotDifficulty(spec.difficulty ?? configuration.botDifficulty ?? "normal"),
+    const requested = configuration.bots ?? configuration.botSeats ?? [];
+    if (!Array.isArray(requested)) fail("INVALID_LOBBY", "Lista botów musi być tablicą.");
+    const humanCount = this.roomObj?.players?.length ?? 1;
+    const capacity = Math.max(0, this.maxSeats - humanCount);
+    const specs = requested.slice(0, capacity).map((item, index) => {
+      const source = Number.isInteger(item) ? { seat: item } : (item ?? {});
+      return {
+        name: normalizePlayerName(source.name ?? `Bot ${index + 1}`),
+        difficulty: normalizeBotDifficulty(source.difficulty ?? configuration.botDifficulty ?? "normal"),
       };
-    }
-    this.lobby = validateLobby({ maxSeats: nextCount, seats });
-    this.revision += 1;
-    this._broadcast({ type: "lobby", lobby: this.lobby, revision: this.revision });
-    this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
+    });
+    this.botSpecs = specs;
+    this._rebuildLobby();
+    this._broadcastLobbyMetadata();
     return cloneJson(this.lobby);
   }
 
   setBotSeat(seat, { name, difficulty = "normal" } = {}) {
-    this._requireHost("Only the host can configure bot seats.");
-    if (!Number.isInteger(seat) || seat <= 0 || seat >= this.lobby.maxSeats) {
-      fail("INVALID_LOBBY", "Bot seat is outside the lobby.");
-    }
-    const existing = this.lobby.seats[seat];
-    if (existing.kind === "human" && existing.connected) fail("SEAT_IN_USE", "A connected player already occupies that seat.");
-    const bots = this.lobby.seats
-      .filter((entry) => entry.kind === "bot" && entry.seat !== seat)
-      .map((entry) => ({ seat: entry.seat, name: entry.name, difficulty: entry.difficulty }));
-    bots.push({ seat, name: name ?? `Bot ${seat}`, difficulty });
-    return this.configureLobby({ maxSeats: this.lobby.maxSeats, bots });
+    this._requireHost("Tylko gospodarz może konfigurować boty.");
+    if (!Number.isInteger(seat) || seat <= 0 || seat >= this.maxSeats) fail("INVALID_LOBBY", "Nieprawidłowe miejsce bota.");
+    const humanCount = this.roomObj?.players?.length ?? 1;
+    if (seat < humanCount) fail("SEAT_IN_USE", "To miejsce zajmuje połączony gracz.");
+    const targetCount = Math.min(this.maxSeats - humanCount, Math.max(this.botSpecs.length, seat - humanCount + 1));
+    const next = Array.from({ length: targetCount }, (_, index) => this.botSpecs[index] ?? {
+      name: `Bot ${index + 1}`,
+      difficulty: "normal",
+    });
+    next[seat - humanCount] = { name: normalizePlayerName(name ?? `Bot ${seat}`), difficulty: normalizeBotDifficulty(difficulty) };
+    return this.configureLobby({ bots: next });
   }
 
   clearBotSeat(seat) {
-    this._requireHost("Only the host can configure bot seats.");
-    const bots = this.lobby.seats
-      .filter((entry) => entry.kind === "bot" && entry.seat !== seat)
-      .map((entry) => ({ seat: entry.seat, name: entry.name, difficulty: entry.difficulty }));
-    return this.configureLobby({ maxSeats: this.lobby.maxSeats, bots });
+    this._requireHost("Tylko gospodarz może konfigurować boty.");
+    const humanCount = this.roomObj?.players?.length ?? 1;
+    const index = seat - humanCount;
+    if (index < 0 || index >= this.botSpecs.length) return cloneJson(this.lobby);
+    const next = this.botSpecs.filter((_, candidate) => candidate !== index);
+    return this.configureLobby({ bots: next });
   }
 
-  startGame(payload = undefined) {
-    this._requireHost("Only the host can start the game.");
-    if (this.inGame) fail("GAME_STARTED", "The game has already started.");
-    const unready = this.lobby.seats.filter((seat) => seat.kind === "empty" || (seat.kind === "human" && !seat.connected));
-    if (unready.length) fail("LOBBY_NOT_READY", "Every seat must contain a connected player or a bot.");
-    this.inGame = true;
-    this.paused = false;
-    this.pauseReason = null;
-    this.revision += 1;
-    const message = { type: "start", revision: this.revision };
-    if (payload !== undefined) {
-      assertJsonSafe(payload, "start payload");
-      message.payload = payload;
-    }
-    this._broadcast(message);
-    this._emit("onStart", cloneJson(message), this.snapshot);
+  async startGame(payload = undefined) {
+    this._requireHost("Tylko gospodarz może rozpocząć grę.");
+    if (this.inGame) fail("GAME_STARTED", "Gra już się rozpoczęła.");
+    const humans = this.roomObj?.players?.length ?? 0;
+    const botCount = this.botSpecs.length;
+    const seatCount = humans + botCount;
+    if (seatCount < MIN_SEATS || seatCount > this.maxSeats) fail("LOBBY_NOT_READY", "Stolik nie ma poprawnej liczby graczy.");
+
+    const response = await this._request({
+      type: "game.start",
+      roomId: this.roomCode,
+      botCount,
+    }, ["game.started"]);
+    if (payload !== undefined) this.startPayload = cloneJson(payload);
+    return response.revision ?? this.revision;
+  }
+
+  sendAction(action, payload = {}) {
+    if (!this.inGame) fail("GAME_NOT_STARTED", "Gra jeszcze się nie rozpoczęła.");
+    if (this.paused) fail("GAME_PAUSED", this.pauseReason?.message ?? "Gra jest wstrzymana.");
+    if (typeof action !== "string" || !action.trim() || action.length > 64) fail("INVALID_ACTION", "Nieprawidłowa akcja.");
+    const actionId = `${this.session?.id ?? "session"}:${++this.actionSequence}`;
+    this._send({
+      type: "game.action",
+      roomId: this.roomCode,
+      action: action.trim(),
+      actionId,
+      payload: cloneJson(payload),
+    });
+    return actionId;
+  }
+
+  broadcastViews(authoritativeState) {
+    this._requireHost("Tylko gospodarz może publikować stan gry.");
+    if (!this.inGame) fail("GAME_NOT_STARTED", "Gra jeszcze się nie rozpoczęła.");
+    if (typeof this.filterState !== "function") fail("FILTER_REQUIRED", "Brak filtra prywatnego widoku gracza.");
+
+    this.revision = Math.max(0, this.revision) + 1;
+    this._send({
+      type: "game.state.commit",
+      roomId: this.roomCode,
+      revision: this.revision,
+      state: cloneJson(authoritativeState),
+    });
+
+    const players = this.roomObj?.players ?? [];
+    players.forEach((player, seat) => {
+      if (player.id === this.session?.id || !player.connected) return;
+      const view = this.filterState(authoritativeState, seat, { revision: this.revision, roomCode: this.roomCode });
+      if (view === undefined) fail("FILTER_FAILED", `Brak prywatnego widoku dla miejsca ${seat}.`);
+      this._send({
+        type: "game.state.publish",
+        roomId: this.roomCode,
+        revision: this.revision,
+        toSessionId: player.id,
+        state: cloneJson(view),
+      });
+    });
+    this._emit("onState", authoritativeState, { revision: this.revision, authoritative: true, seat: this.localSeat });
     return this.revision;
   }
 
-  pauseGame({ code = "GAME_PAUSED", message = "The game is paused.", seat = null } = {}) {
-    this._requireHost("Only the host can pause the game.");
-    if (!this.inGame) return false;
-    if (this.paused) return true;
+  pauseGame({ code = "GAME_PAUSED", message = "Gra jest wstrzymana.", seat = null } = {}) {
     this.paused = true;
-    this.pauseReason = { code: String(code).slice(0, 64), message: String(message).slice(0, 240), seat };
-    this._broadcast({ type: "error", code: this.pauseReason.code, message: this.pauseReason.message });
+    this.pauseReason = { code, message, seat };
     this._emit("onConnection", { status: "game-paused", ...this.pauseReason });
     return true;
   }
 
-  sendAction(action, payload = {}) {
-    if (!this.inGame) fail("GAME_NOT_STARTED", "Actions can only be sent after the game starts.");
-    if (this.paused) fail("GAME_PAUSED", this.pauseReason?.message ?? "The game is paused.");
-    if (!isShortString(action, 64)) fail("INVALID_ACTION", "Action name is invalid.");
-    assertJsonSafe(payload, "action payload");
-    const actionId = makeActionId(this.peerId || "local", ++this.actionSequence);
-    const message = { type: "action", action, payload, actionId, revision: Math.max(0, this.lastRevision, this.revision) };
-    if (this.role === "guest") {
-      const host = this.peers.get("host");
-      if (!host || !channelOpen(host.channel)) fail("HOST_UNAVAILABLE", "The host connection is not open.");
-      this._sendChannel(host.channel, message);
-    } else if (this.role === "host") {
-      void this._dispatchHostAction({ ...message, seat: 0, peerId: this.peerId, local: true });
-    } else {
-      fail("NOT_CONNECTED", "Join or create a room first.");
-    }
-    return actionId;
-  }
-
-  /**
-   * Increment the authoritative revision and send a distinct filtered view to
-   * every guest. `filterState` is deliberately required: silently broadcasting
-   * the full state would leak hands, deck order and RNG data.
-   */
-  broadcastViews(authoritativeState, resolution = null) {
-    this._requireHost("Only the host can broadcast state.");
-    if (typeof this.filterState !== "function") {
-      fail("FILTER_REQUIRED", "Provide filterState(state, seat) before broadcasting card-game state.");
-    }
-    this.revision += 1;
-    for (const peer of this.peers.values()) {
-      if (!Number.isInteger(peer.seat) || !channelOpen(peer.channel)) continue;
-      const view = this.filterState(authoritativeState, peer.seat, {
-        revision: this.revision,
-        roomCode: this.roomCode,
-      });
-      if (view === undefined) fail("FILTER_FAILED", `filterState returned undefined for seat ${peer.seat}.`);
-      this._sendChannel(peer.channel, { type: "state", revision: this.revision, state: view });
-    }
-    this._emit("onState", authoritativeState, { revision: this.revision, authoritative: true, seat: 0 });
-    if (resolution) {
-      this.resolveAction(resolution.actionId, resolution.ok !== false, resolution.result, resolution);
-    }
-    return this.revision;
-  }
-
   resolveAction(actionId, ok = true, result = null, options = {}) {
-    this._requireHost("Only the host can resolve actions.");
-    if (!isShortString(actionId, 128)) fail("INVALID_ACTION", "Action ID is invalid.");
-    const message = { type: "resolution", actionId, ok: Boolean(ok), revision: this.revision };
-    if (message.ok) {
-      message.result = result;
-    } else {
-      message.error = {
-        code: String(options.code ?? options.error?.code ?? "ACTION_REJECTED").slice(0, 64),
-        message: String(options.message ?? options.error?.message ?? "Action was rejected.").slice(0, 240),
-      };
-    }
-    const target = options.peerId
-      ? this.peers.get(options.peerId)
-      : options.seat !== undefined
-        ? [...this.peers.values()].find((peer) => peer.seat === options.seat)
-        : this.peers.get(this._actionOrigins.get(actionId));
-    if (target?.channel && channelOpen(target.channel)) this._sendChannel(target.channel, message);
-    if (!target && options.broadcast) this._broadcast(message);
-    this._actionOrigins.delete(actionId);
-    this._emit("onResolution", cloneJson(message), { authoritative: true });
-    return message;
+    const resolution = {
+      actionId,
+      ok: Boolean(ok),
+      revision: this.revision,
+      ...(ok ? { result } : { error: { code: options.code ?? "ACTION_REJECTED", message: options.message ?? "Akcja odrzucona." } }),
+    };
+    this._emit("onResolution", resolution, { authoritative: this.role === "host" });
+    return resolution;
   }
 
   close() {
     this._closing = true;
-    for (const peer of this.peers.values()) {
-      try { peer.channel?.close(); } catch { /* best effort */ }
-      try { peer.pc?.close(); } catch { /* best effort */ }
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (socketOpen(this.socket) && this.roomCode) {
+      try { this._send({ type: "room.leave", roomId: this.roomCode }); } catch { /* best effort */ }
     }
-    this.peers.clear();
-    try { this.signalSocket?.close(1000, "session closed"); } catch { /* best effort */ }
-    this.signalSocket = null;
-    this.role = null;
+    try { this.socket?.close(1000, "session closed"); } catch { /* best effort */ }
+    this.socket = null;
+    this.socketPromise = null;
+    this.waiters.splice(0).forEach((waiter) => waiter.reject(new ProtocolError("CONNECTION_CLOSED", "Połączenie zostało zamknięte.")));
+    this._clearRoomState();
+  }
+
+  async _leaveCurrentRoom() {
+    if (!this.roomCode) return;
+    if (socketOpen(this.socket)) {
+      try {
+        await this._request({ type: "room.leave", roomId: this.roomCode }, ["room.left"], 2000);
+      } catch {
+        // A stale room from a previous tab must not prevent creating/joining a new one.
+      }
+    }
+    this._clearRoomState();
+  }
+
+  _clearRoomState() {
+    this.roomObj = null;
     this.roomCode = "";
     this.localSeat = null;
-    this.peerId = "";
+    this.hostSessionId = "";
+    this.role = null;
     this.lobby = null;
+    this.botSpecs = [];
+    this.botSeats = [];
     this.inGame = false;
     this.paused = false;
     this.pauseReason = null;
     this.revision = 0;
     this.lastRevision = -1;
     this.actionSequence = 0;
-    this._seenActions.clear();
-    this._actionOrigins.clear();
   }
 
-  async _openSignal(path, expectedType) {
-    if (!this.signalingUrl) fail("INVALID_SIGNALING_URL", "signalingUrl is required for online play.");
-    const socket = this.webSocketFactory(websocketUrl(this.signalingUrl, path));
-    this.signalSocket = socket;
-    addListener(socket, "message", (event) => this._handleSignalMessage(event.data));
-    addListener(socket, "close", () => {
-      if (!this._closing) {
-        this._emit("onConnection", { status: "signaling-closed" });
-        this._reportError(new ProtocolError("SIGNALING_CLOSED", "The signaling connection closed."));
+  async _ensureSession(name) {
+    await this._connectSocket();
+    const saved = this._loadCredentials();
+    if (saved?.sessionId && saved?.resumeToken) {
+      try {
+        const resumed = await this._request({
+          type: "session.resume",
+          sessionId: saved.sessionId,
+          resumeToken: saved.resumeToken,
+        }, ["session.resumed"]);
+        this.session = resumed.session;
+        this.resumeToken = saved.resumeToken;
+        const existing = (resumed.rooms ?? []).find((room) => room.game === GAME_ID);
+        if (existing) this._syncRoom(existing);
+        return this.session;
+      } catch (error) {
+        if (!new Set(["invalid_session_credentials", "session_expired"]).has(error?.code)) throw error;
+        this._clearCredentials();
       }
-    });
-    addListener(socket, "error", () => this._reportError(new ProtocolError("SIGNALING_FAILED", "Could not connect to signaling.")));
+    }
 
-    return new Promise((resolve, reject) => {
+    const created = await this._request({ type: "session.create", nickname: name }, ["session.created"]);
+    this.session = created.session;
+    this.resumeToken = created.resumeToken;
+    this._saveCredentials();
+    return this.session;
+  }
+
+  _connectSocket() {
+    if (socketOpen(this.socket)) return Promise.resolve(this.socket);
+    if (this.socketPromise) return this.socketPromise;
+    this._closing = false;
+    this.socketPromise = new Promise((resolve, reject) => {
+      let socket;
+      try { socket = this.webSocketFactory(this.serverUrl); }
+      catch (error) { reject(error); return; }
+      this.socket = socket;
       let settled = false;
-      const cleaners = [];
-      const finish = (callback, value) => {
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new ProtocolError("SERVER_TIMEOUT", "Serwer multiplayer nie odpowiedział."));
+        }
+      }, REQUEST_TIMEOUT_MS);
+      addListener(socket, "open", () => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        for (const cleanup of cleaners) cleanup();
-        callback(value);
-      };
-      const timeout = setTimeout(() => finish(
-        reject,
-        new ProtocolError("SIGNALING_TIMEOUT", "Signaling did not respond in time."),
-      ), 10_000);
-      cleaners.push(addListener(socket, "message", (event) => {
-        let message;
-        try { message = JSON.parse(event.data); } catch { return; }
-        if (message.type === expectedType) {
-          finish(resolve, message);
-        } else if (message.type === "error") {
-          finish(reject, new ProtocolError(message.code ?? "SIGNALING_ERROR", message.message ?? "Signaling failed."));
+        this.reconnectAttempt = 0;
+        this._emit("onConnection", { status: "server-connected" });
+        resolve(socket);
+      });
+      addListener(socket, "message", (event) => this._handleMessage(event.data));
+      addListener(socket, "error", () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(new ProtocolError("SERVER_UNAVAILABLE", "Nie udało się połączyć ze wspólnym serwerem QQND."));
         }
-      }));
-      cleaners.push(addListener(socket, "error", () => finish(
-        reject,
-        new ProtocolError("SIGNALING_FAILED", "Could not connect to signaling."),
-      )));
-      cleaners.push(addListener(socket, "close", () => finish(
-        reject,
-        new ProtocolError("SIGNALING_CLOSED", "Signaling closed before the room was ready."),
-      )));
-    });
-  }
-
-  _handleSignalMessage(raw) {
-    let message;
-    try { message = JSON.parse(raw); } catch { return; }
-    if (!isRecord(message)) return;
-    if (message.type === "relay" && isRecord(message.signal)) {
-      void this._handleRelay(String(message.from), message.signal).catch((error) => this._reportError(error));
-    } else if (message.type === "peer-left" && this.role === "host") {
-      this._removePeer(String(message.peerId));
-    } else if (message.type === "host-left" && this.role === "guest") {
-      this.paused = true;
-      this.pauseReason = { code: "HOST_UNAVAILABLE", message: "The host left the room.", seat: 0 };
-      this._emit("onConnection", { status: "host-disconnected" });
-      this._reportError(new ProtocolError("HOST_UNAVAILABLE", "The host left the room."));
-    } else if (message.type === "error") {
-      this._reportError(new ProtocolError(message.code ?? "SIGNALING_ERROR", message.message ?? "Signaling error."));
-    }
-  }
-
-  async _createGuestOffer() {
-    const pc = this.peerConnectionFactory(this.rtcConfig);
-    const channel = pc.createDataChannel("puchate-cafe", { ordered: true });
-    const peer = { id: "host", pc, channel, seat: 0, pendingCandidates: [], remoteDescriptionSet: false };
-    this.peers.set("host", peer);
-    this._wirePeer(peer);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    this._relay("host", { description: pc.localDescription ?? offer });
-  }
-
-  async _handleRelay(from, signal) {
-    if (signal.description) {
-      if (this.role === "host" && signal.description.type === "offer") {
-        let peer = this.peers.get(from);
-        if (!peer) peer = this._createHostPeer(from);
-        await peer.pc.setRemoteDescription(signal.description);
-        peer.remoteDescriptionSet = true;
-        await this._flushCandidates(peer);
-        const answer = await peer.pc.createAnswer();
-        await peer.pc.setLocalDescription(answer);
-        this._relay(from, { description: peer.pc.localDescription ?? answer });
-      } else if (this.role === "guest" && signal.description.type === "answer") {
-        const peer = this.peers.get("host");
-        if (!peer) return;
-        await peer.pc.setRemoteDescription(signal.description);
-        peer.remoteDescriptionSet = true;
-        await this._flushCandidates(peer);
-      }
-    } else if (signal.candidate) {
-      let peer = this.role === "host" ? this.peers.get(from) : this.peers.get("host");
-      if (!peer && this.role === "host") peer = this._createHostPeer(from);
-      if (!peer) return;
-      if (!peer.remoteDescriptionSet) peer.pendingCandidates.push(signal.candidate);
-      else await peer.pc.addIceCandidate(signal.candidate);
-    }
-  }
-
-  async _flushCandidates(peer) {
-    for (const candidate of peer.pendingCandidates.splice(0)) await peer.pc.addIceCandidate(candidate);
-  }
-
-  _createHostPeer(peerId) {
-    const pc = this.peerConnectionFactory(this.rtcConfig);
-    const peer = { id: peerId, pc, channel: null, seat: null, pendingCandidates: [], remoteDescriptionSet: false };
-    this.peers.set(peerId, peer);
-    this._wirePeer(peer);
-    return peer;
-  }
-
-  _wirePeer(peer) {
-    peer.pc.onicecandidate = (event) => {
-      if (event.candidate) this._relay(peer.id, { candidate: event.candidate });
-    };
-    peer.pc.onconnectionstatechange = () => {
-      const status = peer.pc.connectionState;
-      this._emit("onPeerChange", { peerId: peer.id, seat: peer.seat, status });
-      if (["failed", "closed", "disconnected"].includes(status) && this.role === "host") this._removePeer(peer.id);
-    };
-    if (this.role === "host") {
-      peer.pc.ondatachannel = (event) => {
-        const unreliable = event.channel.ordered === false
-          || event.channel.maxRetransmits != null
-          || event.channel.maxPacketLifeTime != null;
-        if (event.channel.label !== "puchate-cafe" || unreliable) {
-          event.channel.close();
-          return;
+      });
+      addListener(socket, "close", () => {
+        this.socketPromise = null;
+        this.socket = null;
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          reject(new ProtocolError("SERVER_UNAVAILABLE", "Połączenie z serwerem zostało zamknięte."));
         }
-        peer.channel = event.channel;
-        this._wireChannel(peer);
-      };
-    } else {
-      this._wireChannel(peer);
+        if (!this._closing) {
+          this._emit("onConnection", { status: "server-disconnected" });
+          this._scheduleReconnect();
+        }
+      });
+    }).finally(() => {
+      if (!socketOpen(this.socket)) this.socketPromise = null;
+    });
+    return this.socketPromise;
+  }
+
+  _scheduleReconnect() {
+    if (this._closing || this.reconnectTimer || !this._loadCredentials()) return;
+    const delay = Math.min(5000, 500 * 2 ** Math.min(this.reconnectAttempt++, 4));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this._resumeConnection().catch((error) => {
+        this._reportError(error);
+        this._scheduleReconnect();
+      });
+    }, delay);
+  }
+
+  async _resumeConnection() {
+    const saved = this._loadCredentials();
+    if (!saved) return;
+    await this._connectSocket();
+    const resumed = await this._request({
+      type: "session.resume",
+      sessionId: saved.sessionId,
+      resumeToken: saved.resumeToken,
+    }, ["session.resumed"]);
+    this.session = resumed.session;
+    this.resumeToken = saved.resumeToken;
+    const room = (resumed.rooms ?? []).find((entry) => entry.game === GAME_ID && (!this.roomCode || entry.id === this.roomCode));
+    if (room) {
+      this._syncRoom(room);
+      if (room.status === "in_game") {
+        this.inGame = true;
+        this._send({ type: "game.state.get", roomId: room.id });
+      }
     }
+    this._emit("onConnection", { status: "reconnected", roomCode: this.roomCode });
   }
 
-  _wireChannel(peer) {
-    const channel = peer.channel;
-    if (!channel) return;
-    addListener(channel, "open", () => {
-      if (this.role === "guest") {
-        this._sendChannel(channel, { type: "hello", protocol: PROTOCOL_VERSION, name: this.localName });
-      }
-      this._emit("onPeerChange", { peerId: peer.id, seat: peer.seat, status: "connected" });
-    });
-    addListener(channel, "message", (event) => this._handleChannelMessage(peer, event.data));
-    addListener(channel, "close", () => {
-      if (this.role === "host") this._removePeer(peer.id);
-      else {
-        this.paused = true;
-        this.pauseReason = { code: "HOST_UNAVAILABLE", message: "The host connection closed.", seat: 0 };
-        this._emit("onConnection", { status: "host-disconnected" });
+  _request(message, responseTypes, timeoutMs = REQUEST_TIMEOUT_MS) {
+    const types = new Set(responseTypes);
+    return new Promise((resolve, reject) => {
+      const waiter = { types, resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
+        reject(new ProtocolError("SERVER_TIMEOUT", `Brak odpowiedzi: ${[...types].join(", ")}.`));
+      }, timeoutMs);
+      this.waiters.push(waiter);
+      try { this._send(message); }
+      catch (error) {
+        clearTimeout(waiter.timer);
+        this.waiters = this.waiters.filter((candidate) => candidate !== waiter);
+        reject(error);
       }
     });
   }
 
-  _handleChannelMessage(peer, raw) {
+  _send(message) {
+    if (!socketOpen(this.socket)) fail("SERVER_UNAVAILABLE", "Brak połączenia ze wspólnym serwerem QQND.");
+    this.socket.send(JSON.stringify(message));
+  }
+
+  _handleMessage(raw) {
     let message;
-    try {
-      message = parseProtocolMessage(raw);
-    } catch (error) {
-      this._sendError(peer, error.code ?? "INVALID_MESSAGE", error.message);
-      this._reportError(error);
-      return;
-    }
-    const hostAllowed = new Set(["hello", "action", "ping"]);
-    const guestAllowed = new Set(["welcome", "lobby", "start", "state", "resolution", "error", "ping"]);
-    if ((this.role === "host" && !hostAllowed.has(message.type)) || (this.role === "guest" && !guestAllowed.has(message.type))) {
-      this._sendError(peer, "UNEXPECTED_MESSAGE", `Unexpected ${message.type} packet.`);
+    try { message = typeof raw === "string" ? JSON.parse(raw) : JSON.parse(String(raw)); }
+    catch { this._reportError(new ProtocolError("INVALID_JSON", "Serwer wysłał nieprawidłową wiadomość.")); return; }
+    if (!isRecord(message) || typeof message.type !== "string") return;
+
+    if (message.type === "error") {
+      const error = new ProtocolError(String(message.code ?? "SERVER_ERROR"), String(message.message ?? message.code ?? "Błąd serwera."));
+      const waiter = this.waiters.shift();
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      } else this._reportError(error);
       return;
     }
 
-    if (message.type === "ping") {
-      if (!message.reply) this._sendChannel(peer.channel, { type: "ping", at: message.at, reply: true });
-      return;
-    }
-    if (this.role === "host") {
-      if (message.type === "hello") this._acceptHello(peer, message);
-      if (message.type === "action") void this._acceptRemoteAction(peer, message);
-      return;
-    }
-    this._acceptHostMessage(message);
-  }
-
-  _acceptHello(peer, message) {
-    if (this.inGame) {
-      this._sendError(peer, "GAME_STARTED", "This game has already started.");
-      peer.channel?.close();
-      return;
-    }
-    if (!Number.isInteger(peer.seat)) {
-      const seat = this.lobby.seats.find((entry) => entry.seat > 0 && entry.kind === "empty");
-      if (!seat) {
-        this._sendError(peer, "ROOM_FULL", "No human seat is available.");
-        peer.channel?.close();
-        return;
-      }
-      peer.seat = seat.seat;
-    }
-    const seat = this.lobby.seats[peer.seat];
-    seat.kind = "human";
-    seat.name = normalizePlayerName(message.name);
-    seat.connected = true;
-    seat.ready = true;
-    this.revision += 1;
-    this._sendChannel(peer.channel, {
-      type: "welcome",
-      protocol: PROTOCOL_VERSION,
-      seat: peer.seat,
-      lobby: this.lobby,
-      revision: this.revision,
-    });
-    this._broadcast({ type: "lobby", lobby: this.lobby, revision: this.revision });
-    this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
-  }
-
-  async _acceptRemoteAction(peer, message) {
-    if (!this.inGame || !Number.isInteger(peer.seat)) {
-      this._sendError(peer, "GAME_NOT_STARTED", "The game is not ready for actions.", message.actionId);
-      return;
-    }
-    if (this.paused) {
-      this._sendError(peer, "GAME_PAUSED", this.pauseReason?.message ?? "The game is paused.", message.actionId);
-      return;
-    }
-    if (message.revision > this.revision) {
-      this._sendError(peer, "INVALID_REVISION", "The action references a future state revision.", message.actionId);
-      return;
-    }
-    if (this._seenActions.has(message.actionId)) {
-      this._sendError(peer, "DUPLICATE_ACTION", "This action was already received.", message.actionId);
-      return;
-    }
-    this._rememberAction(message.actionId);
-    this._actionOrigins.set(message.actionId, peer.id);
-    await this._dispatchHostAction({ ...message, seat: peer.seat, peerId: peer.id, local: false });
-  }
-
-  async _dispatchHostAction(request) {
-    if (this.paused) {
-      if (!request.local) {
-        this.resolveAction(request.actionId, false, null, {
-          peerId: request.peerId,
-          code: "GAME_PAUSED",
-          message: this.pauseReason?.message ?? "The game is paused.",
-        });
-      }
-      return;
-    }
-    const handler = this.callbacks.onAction;
-    if (typeof handler !== "function") {
-      if (!request.local) this._sendError(this.peers.get(request.peerId), "NO_ACTION_HANDLER", "Host cannot process actions.", request.actionId);
-      return;
-    }
-    try {
-      const outcome = await handler({
-        seat: request.seat,
-        action: request.action,
-        payload: cloneJson(request.payload),
-        actionId: request.actionId,
-        clientRevision: request.revision,
-        hostRevision: this.revision,
-        local: request.local,
-      }, this);
-      if (outcome !== undefined && !request.local) {
-        const normalized = isRecord(outcome) ? outcome : { result: outcome };
-        this.resolveAction(request.actionId, normalized.ok !== false, normalized.result ?? null, {
-          ...normalized,
-          peerId: request.peerId,
-        });
-      }
-    } catch (error) {
-      if (!request.local) {
-        this.resolveAction(request.actionId, false, null, {
-          peerId: request.peerId,
-          code: error.code ?? "ACTION_FAILED",
-          message: error.message ?? "Action failed.",
-        });
-      }
-      this._reportError(error);
+    this._processMessage(message);
+    const index = this.waiters.findIndex((waiter) => waiter.types.has(message.type));
+    if (index >= 0) {
+      const [waiter] = this.waiters.splice(index, 1);
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
     }
   }
 
-  _acceptHostMessage(message) {
-    if (message.type === "welcome") {
-      this.localSeat = message.seat;
-      this.lobby = cloneJson(message.lobby);
-      this.revision = Math.max(this.revision, message.revision);
-      this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
-      this._emit("onConnection", { status: "connected", seat: this.localSeat, roomCode: this.roomCode });
-    } else if (message.type === "lobby") {
-      if (message.revision < this.revision) return;
-      this.revision = message.revision;
-      this.lobby = cloneJson(message.lobby);
-      this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
-    } else if (message.type === "start") {
-      if (message.revision < this.revision) return;
-      this.revision = message.revision;
+  _processMessage(message) {
+    if (message.type === "session.created" || message.type === "session.resumed") {
+      if (message.session) this.session = cloneJson(message.session);
+      if (message.resumeToken) {
+        this.resumeToken = message.resumeToken;
+        this._saveCredentials();
+      }
+      return;
+    }
+
+    if (["room.created", "room.joined", "room.updated"].includes(message.type) && message.room?.game === GAME_ID) {
+      this._syncRoom(message.room);
+      return;
+    }
+
+    if (message.type === "room.message" && message.roomId === this.roomCode) {
+      const payload = message.payload;
+      if (payload?.type === "puchate.lobby" && message.fromSessionId === this.hostSessionId) {
+        this.botSpecs = Array.isArray(payload.bots) ? payload.bots.slice(0, MAX_SEATS).map((bot, index) => ({
+          name: normalizePlayerName(bot?.name ?? `Bot ${index + 1}`),
+          difficulty: normalizeBotDifficulty(bot?.difficulty ?? "normal"),
+        })) : [];
+        this._rebuildLobby();
+      }
+      return;
+    }
+
+    if (message.type === "game.started" && message.game === GAME_ID) {
+      if (message.room?.game === GAME_ID) this._syncRoom(message.room);
       this.inGame = true;
       this.paused = false;
       this.pauseReason = null;
+      if (Number.isInteger(message.seat)) this.localSeat = message.seat;
+      this.hostSessionId = String(message.hostSessionId ?? this.hostSessionId);
+      this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
+      this.botSeats = Array.isArray(message.botSeats) ? message.botSeats.filter(Number.isInteger) : [];
+      this.revision = Number.isInteger(message.revision) ? message.revision : this.revision;
+      this._rebuildLobby(true);
       this._emit("onStart", cloneJson(message), this.snapshot);
-    } else if (message.type === "state") {
-      if (message.revision <= this.lastRevision) return;
-      this.lastRevision = message.revision;
-      this.revision = Math.max(this.revision, message.revision);
-      this._emit("onState", message.state, { revision: message.revision, authoritative: false, seat: this.localSeat });
-    } else if (message.type === "resolution") {
-      this._emit("onResolution", cloneJson(message), { authoritative: false });
-    } else if (message.type === "error") {
-      if (["PLAYER_DISCONNECTED", "GAME_PAUSED", "HOST_UNAVAILABLE"].includes(message.code)) {
-        this.paused = true;
-        this.pauseReason = { code: message.code, message: message.message, seat: null };
-        this._emit("onConnection", { status: "game-paused", ...this.pauseReason });
+      return;
+    }
+
+    if (message.type === "game.action" && message.roomId === this.roomCode) {
+      if (this.role !== "host") return;
+      const request = {
+        seat: message.seat,
+        action: message.action,
+        payload: cloneJson(message.payload ?? {}),
+        actionId: message.actionId ?? `${message.fromSessionId}:${message.actionSeq}`,
+        clientRevision: this.revision,
+        hostRevision: this.revision,
+        peerId: message.fromSessionId,
+        local: message.fromSessionId === this.session?.id,
+      };
+      Promise.resolve(this.callbacks.onAction?.(request, this))
+        .then((result) => {
+          if (result !== undefined) this._emit("onResolution", { actionId: request.actionId, ok: result?.ok !== false, result: result?.result ?? null, revision: this.revision }, { authoritative: true });
+        })
+        .catch((error) => this._reportError(error));
+      return;
+    }
+
+    if (message.type === "game.state.committed" && message.roomId === this.roomCode) {
+      this.revision = Math.max(this.revision, Number(message.revision) || 0);
+      return;
+    }
+
+    if (message.type === "game.state" && message.roomId === this.roomCode) {
+      const revision = Number(message.revision) || 0;
+      if (revision < this.lastRevision) return;
+      this.lastRevision = revision;
+      this.revision = Math.max(this.revision, revision);
+      if (Number.isInteger(message.viewerSeat)) this.localSeat = message.viewerSeat;
+      if (Array.isArray(message.botSeats)) this.botSeats = message.botSeats.filter(Number.isInteger);
+      if (message.hostSessionId) {
+        this.hostSessionId = String(message.hostSessionId);
+        this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
       }
-      this._reportError(new ProtocolError(message.code, message.message));
+      const canonicalForHost = this.role === "host" && message.authoritative !== true;
+      this._emit("onState", cloneJson(message.state), {
+        revision,
+        authoritative: canonicalForHost,
+        serverAuthoritative: Boolean(message.authoritative),
+        seat: this.localSeat,
+      });
+      return;
     }
-  }
 
-  _rememberAction(actionId) {
-    this._seenActions.add(actionId);
-    if (this._seenActions.size > 1024) this._seenActions.delete(this._seenActions.values().next().value);
-  }
+    if (message.type === "game.state.empty" && message.roomId === this.roomCode) {
+      if (Number.isInteger(message.viewerSeat)) this.localSeat = message.viewerSeat;
+      return;
+    }
 
-  _removePeer(peerId) {
-    const peer = this.peers.get(peerId);
-    if (!peer) return;
-    this.peers.delete(peerId);
-    try { peer.pc?.close(); } catch { /* best effort */ }
-    const disconnectedSeat = Number.isInteger(peer.seat) ? peer.seat : null;
-    const occupied = disconnectedSeat !== null && this.lobby?.seats[disconnectedSeat]?.kind === "human";
-    if (occupied) {
-      if (this.inGame) {
-        const seat = this.lobby.seats[disconnectedSeat];
-        seat.connected = false;
-        seat.ready = false;
-        this.revision += 1;
-        this.pauseGame({
-          code: "PLAYER_DISCONNECTED",
-          message: `${seat.name || "A player"} lost the connection. The game is paused.`,
-          seat: disconnectedSeat,
-        });
-      } else {
-        this.lobby.seats[disconnectedSeat] = emptySeat(disconnectedSeat);
-        this.revision += 1;
-        this._broadcast({ type: "lobby", lobby: this.lobby, revision: this.revision });
-        this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
+    if (message.type === "game.player.connection" && message.roomId === this.roomCode) {
+      if (Array.isArray(message.botSeats)) this.botSeats = message.botSeats.filter(Number.isInteger);
+      if (message.hostSessionId) {
+        this.hostSessionId = String(message.hostSessionId);
+        this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
       }
+      this._emit("onPeerChange", {
+        status: message.connected ? "connected" : "disconnected",
+        seat: message.seat,
+        nickname: message.nickname,
+        graceMs: message.graceMs,
+        graceDeadline: message.graceDeadline,
+        reclaimedFromBot: Boolean(message.reclaimedFromBot),
+      });
+      return;
     }
-    this._emit("onPeerChange", { peerId, seat: disconnectedSeat, status: "disconnected" });
-  }
 
-  _relay(target, signal) {
-    if (!socketOpen(this.signalSocket)) fail("SIGNALING_CLOSED", "Signaling connection is not open.");
-    this.signalSocket.send(JSON.stringify({ type: "relay", target, signal }));
-  }
+    if (message.type === "game.player.bot_takeover" && message.roomId === this.roomCode) {
+      if (Array.isArray(message.botSeats)) this.botSeats = message.botSeats.filter(Number.isInteger);
+      if (message.hostSessionId) {
+        this.hostSessionId = String(message.hostSessionId);
+        this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
+      }
+      this._emit("onPeerChange", {
+        status: "bot-takeover",
+        seat: message.seat,
+        nickname: message.nickname,
+        botSeats: cloneJson(this.botSeats),
+      });
+      return;
+    }
 
-  _broadcast(message) {
-    for (const peer of this.peers.values()) {
-      if (channelOpen(peer.channel)) this._sendChannel(peer.channel, message);
+    if (message.type === "game.host.changed" && message.roomId === this.roomCode) {
+      this.hostSessionId = String(message.hostSessionId ?? "");
+      this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
+      this._emit("onPeerChange", { status: "host-changed", hostSessionId: this.hostSessionId, isLocalHost: this.role === "host" });
+      if (this.role === "host") this._send({ type: "game.state.get", roomId: this.roomCode });
+      return;
+    }
+
+    if (message.type === "game.presence" && message.roomId === this.roomCode) {
+      if (message.hostSessionId) {
+        this.hostSessionId = String(message.hostSessionId);
+        this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
+      }
+      if (Array.isArray(message.botSeats)) this.botSeats = message.botSeats.filter(Number.isInteger);
+      return;
+    }
+
+    if (message.type === "room.closed" && message.roomId === this.roomCode) {
+      this._reportError(new ProtocolError("ROOM_CLOSED", "Pokój został zamknięty."));
+      this._clearRoomState();
     }
   }
 
-  _sendChannel(channel, message) {
-    if (!channelOpen(channel)) fail("PEER_UNAVAILABLE", "Peer channel is not open.");
-    channel.send(encodeProtocolMessage(message));
+  _syncRoom(room) {
+    if (!room || room.game !== GAME_ID) return;
+    this.roomObj = cloneJson(room);
+    this.roomCode = normalizeRoomCode(room.id);
+    this.maxSeats = validateSeatCount(room.maxPlayers ?? this.maxSeats ?? MAX_SEATS);
+    this.hostSessionId = String(room.ownerSessionId ?? this.hostSessionId);
+    this.localSeat = this.session ? (room.players ?? []).findIndex((player) => player.id === this.session.id) : this.localSeat;
+    this.role = this.session?.id === this.hostSessionId ? "host" : "guest";
+    if (room.status === "in_game") this.inGame = true;
+    const availableBotSlots = Math.max(0, this.maxSeats - (room.players?.length ?? 0));
+    if (!this.inGame && this.botSpecs.length > availableBotSlots) this.botSpecs = this.botSpecs.slice(0, availableBotSlots);
+    this._rebuildLobby(this.inGame);
   }
 
-  _sendError(peer, code, message, actionId = undefined) {
-    if (!peer?.channel || !channelOpen(peer.channel)) return;
-    const packet = { type: "error", code: String(code).slice(0, 64), message: String(message).slice(0, 240) };
-    if (actionId) packet.actionId = actionId;
-    this._sendChannel(peer.channel, packet);
+  _rebuildLobby(useRuntimeBots = false) {
+    if (!this.roomObj) return;
+    const seats = Array.from({ length: this.maxSeats }, (_, seat) => emptySeat(seat));
+    const humans = this.roomObj.players ?? [];
+    humans.forEach((player, seat) => {
+      if (seat >= seats.length) return;
+      seats[seat] = {
+        seat,
+        kind: "human",
+        name: String(player.nickname ?? `Gracz ${seat + 1}`),
+        sessionId: player.id,
+        connected: Boolean(player.connected),
+        ready: Boolean(player.connected),
+        isHost: player.id === this.hostSessionId,
+      };
+    });
+
+    const runtimeBotSeats = useRuntimeBots && this.botSeats.length
+      ? this.botSeats
+      : this.botSpecs.map((_, index) => humans.length + index);
+    runtimeBotSeats.forEach((seat, index) => {
+      if (!Number.isInteger(seat) || seat < humans.length || seat >= seats.length) return;
+      const spec = this.botSpecs[index] ?? { name: `Bot ${index + 1}`, difficulty: "normal" };
+      seats[seat] = {
+        seat,
+        kind: "bot",
+        name: spec.name,
+        connected: false,
+        ready: true,
+        difficulty: spec.difficulty,
+      };
+    });
+
+    this.lobby = { maxSeats: this.maxSeats, seats };
+    this._emit("onLobby", cloneJson(this.lobby), this.snapshot);
+  }
+
+  _broadcastLobbyMetadata() {
+    if (this.role !== "host" || !this.roomCode || !socketOpen(this.socket)) return;
+    this._send({
+      type: "room.send",
+      roomId: this.roomCode,
+      payload: { type: "puchate.lobby", bots: cloneJson(this.botSpecs), maxSeats: this.maxSeats },
+    });
   }
 
   _requireHost(message) {
     if (this.role !== "host") fail("HOST_ONLY", message);
   }
 
+  _loadCredentials() {
+    if (!this.storage) return null;
+    try {
+      const raw = this.storage.getItem(SESSION_STORAGE_KEY);
+      const value = raw ? JSON.parse(raw) : null;
+      if (!value?.sessionId || !value?.resumeToken) return null;
+      return value;
+    } catch {
+      return null;
+    }
+  }
+
+  _saveCredentials() {
+    if (!this.storage || !this.session?.id || !this.resumeToken) return;
+    try {
+      this.storage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ sessionId: this.session.id, resumeToken: this.resumeToken }));
+    } catch { /* storage is optional */ }
+  }
+
+  _clearCredentials() {
+    if (!this.storage) return;
+    try { this.storage.removeItem(SESSION_STORAGE_KEY); } catch { /* storage is optional */ }
+  }
+
   _emit(name, ...args) {
     const callback = this.callbacks[name];
     if (typeof callback !== "function") return;
-    try { callback(...args); } catch (error) {
-      if (name !== "onError") this._reportError(error);
-    }
+    try { callback(...args); }
+    catch (error) { if (name !== "onError") this._reportError(error); }
   }
 
   _reportError(error) {
     const normalized = error instanceof Error ? error : new Error(String(error));
     if (typeof this.callbacks.onError === "function") {
-      try { this.callbacks.onError(normalized, this.snapshot); } catch { /* user callback */ }
+      try { this.callbacks.onError(normalized, this.snapshot); } catch { /* callback error */ }
     }
   }
 }
