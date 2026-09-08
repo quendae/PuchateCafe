@@ -1,98 +1,87 @@
-# Wdrożenie multiplayera Puchate Café
+# Multiplayer Puchate Café — wspólny serwer QQND
 
-Puchate Café używa tego samego modelu wdrożeniowego co SKAT: strona gry i mały Worker sygnalizacyjny są wdrażane oddzielnie, ale dla gracza działają pod jedną domeną.
+Puchate Café **nie ma własnego Workera, serwera sygnalizacyjnego ani WebRTC**. Multiplayer korzysta ze wspólnego backendu `quendae/qqnd-game-server`, tak jak pozostałe migrowane gry QQND.
 
-| Element | Gdzie trafia |
-| --- | --- |
-| aplikacja Puchate Café | serwer WWW obsługujący `puchate.qqnd.fyi` |
-| `worker/` | Cloudflare Workers + Durable Object |
-| `/api/*` | trasa kierowana przez Cloudflare do Workera |
-
-Worker **nie jest serwerem gry**. Przechowuje jedynie krótkotrwały pokój i przekazuje SDP/ICE potrzebne do zestawienia WebRTC. Po otwarciu DataChannel rozgrywka jest P2P, a host jest jedynym właścicielem pełnego stanu gry.
-
-## 1. Wymagania
-
-- domena `qqnd.fyi` w Cloudflare,
-- `puchate.qqnd.fyi` wystawione przez HTTPS,
-- rekord DNS domeny proxied przez Cloudflare,
-- Node.js 20+ i npm na komputerze używanym do wdrożenia Workera.
-
-## 2. Deploy Workera
-
-```bash
-cd worker
-npm install
-npx wrangler login
-npm run deploy
-```
-
-`wrangler.toml` przypisuje Worker do:
+## Architektura
 
 ```text
-puchate.qqnd.fyi/api/*
+puchate.qqnd.fyi
+      │
+      │ WebSocket
+      ▼
+wss://api.qqnd.fyi/api/v1/ws
+      │
+      ▼
+qqnd-game-server
 ```
 
-Strona główna i zwykłe assety nadal trafiają do serwera WWW. Tylko `/api/*` obsługuje Cloudflare Worker.
+Wspólny serwer odpowiada za:
 
-## 3. Test po wdrożeniu
+- sesje gości i tokeny wznowienia,
+- tworzenie i dołączanie do prywatnych pokoi,
+- ośmioznakowe kody pokoi w formacie `XXXX-XXXX`,
+- kolejność i routing akcji,
+- obecność graczy,
+- reconnect i zachowanie numeru miejsca,
+- przechowanie pełnego snapshotu hosta oraz prywatnych widoków gości,
+- przekazanie hosta po dłuższej utracie połączenia.
 
-Otwórz:
+Puchate Café jest na etapie bridge/Phase 1: zasady i losowanie nadal wykonuje autorytatywny klient-host. Goście wysyłają `game.action` do `qqnd-game-server`; serwer przekazuje akcję aktualnemu hostowi. Host zatwierdza zmianę, zapisuje pełny stan przez `game.state.commit` i publikuje osobny `getPlayerView(state, seat)` przez `game.state.publish` dla każdego człowieka.
+
+Dzięki temu z klienta usunięto cały stary tor SDP/ICE/DataChannel, ale nie trzeba jeszcze przepisywać dużego silnika Puchate Café na TypeScript po stronie backendu.
+
+## Backend
+
+Obsługa gry znajduje się w repozytorium:
 
 ```text
-https://puchate.qqnd.fyi/api/health
+quendae/qqnd-game-server
 ```
 
-Poprawna odpowiedź:
-
-```json
-{"ok":true,"service":"puchate-cafe-signaling","maxGuests":7}
-```
-
-Następnie:
-
-1. otwórz grę w dwóch niezależnych przeglądarkach lub urządzeniach,
-2. na pierwszym urządzeniu wybierz **Multiplayer → Załóż stolik**,
-3. na drugim wybierz **Dołącz** i wpisz sześcioliterowy kod,
-4. sprawdź synchronizację lobby,
-5. rozpocznij grę i wykonaj przynajmniej pełną rundę,
-6. na jednym urządzeniu zamknij kartę podczas gry — pozostała sesja powinna zostać zatrzymana, a kolejne akcje odrzucone.
-
-## 4. Adres sygnalizacji w kliencie
-
-Domyślna konfiguracja klienta używa względnego adresu:
+Game ID:
 
 ```text
-/api
+puchate
 ```
 
-czyli na produkcji automatycznie łączy się z `wss://puchate.qqnd.fyi/api/...`. Użytkownik nie musi wpisywać osobnego adresu serwera, tak jak w działającym wdrożeniu SKAT.
+Zakres graczy: **2–8**. Matchmaking jest na razie wyłączony; używane są prywatne pokoje.
 
-Pole **Ustawienia połączenia** nadal pozwala nadpisać adres. Jest przydatne podczas lokalnego developmentu lub testu Workera na `*.workers.dev`.
+Backend musi być wdrożony zgodnie z instrukcjami w repo `qqnd-game-server` i dostępny pod:
 
-## 5. Model bezpieczeństwa i autorytetu
-
-- host utrzymuje pełny `GameState`, seed, RNG i kolejność talii,
-- gość wysyła wyłącznie `action`/intencję,
-- host wykonuje akcję tym samym dispatcherem co gra lokalna,
-- host po zmianie stanu wysyła osobny `getPlayerView(state, seat)` do każdego gracza,
-- ręka przeciwnika, talia, RNG oraz cudze zakryte wybory nie są serializowane do jego widoku,
-- boty działają wyłącznie po stronie hosta i korzystają z tego samego API akcji,
-- miejsce bota jest zarezerwowane i nie może zostać zajęte przez gościa,
-- po utracie człowieka w trakcie gry host pauzuje autorytet i blokuje dalsze akcje.
-
-To jest model do prywatnych gier znajomych. Host technicznie może podejrzeć własny pełny stan w narzędziach deweloperskich.
-
-## 6. NAT / TURN
-
-Domyślnie WebRTC używa publicznego STUN. W restrykcyjnych sieciach (część sieci komórkowych, firmowych i CGNAT) bezpośrednie zestawienie P2P może się nie udać. W takim przypadku należy dodać własny TURN do `rtcConfig` klienta. TURN przekazuje zaszyfrowany ruch WebRTC; nie zmienia modelu host-authoritative.
-
-## 7. Aktualizacje
-
-Zmiany wyłącznie w wyglądzie lub zasadach gry nie wymagają redeployu Workera. Po zmianie `worker/src/index.js` albo `worker/wrangler.toml` wykonaj ponownie:
-
-```bash
-cd worker
-npm run deploy
+```text
+https://api.qqnd.fyi
+wss://api.qqnd.fyi/api/v1/ws
 ```
 
-Po deployu zawsze sprawdź `/api/health` i utwórz nowy pokój testowy.
+Nie wdrażaj niczego z repo Puchate Café do Cloudflare Workers.
+
+## Frontend
+
+Frontend Puchate Café wymaga tylko zwykłego wdrożenia statycznej aplikacji na `puchate.qqnd.fyi`. Domyślnie łączy się z:
+
+```text
+wss://api.qqnd.fyi/api/v1/ws
+```
+
+Adres można nadpisać w ustawieniach połączenia do lokalnych testów, np.:
+
+```text
+ws://127.0.0.1:3000/api/v1/ws
+```
+
+## Test ręczny
+
+1. Otwórz `https://puchate.qqnd.fyi` w dwóch niezależnych przeglądarkach lub urządzeniach.
+2. Na pierwszym urządzeniu wybierz **Multiplayer → Załóż stolik**.
+3. Skopiuj kod w formacie `XXXX-XXXX`.
+4. Na drugim urządzeniu wybierz **Dołącz** i wpisz kod.
+5. Sprawdź, czy oba klienty widzą tę samą listę graczy.
+6. Host może uzupełnić wolne miejsca botami i rozpocząć grę.
+7. Rozegraj pełną rundę i potwierdź, że gość widzi tylko własną rękę.
+8. Rozłącz jednego gracza i sprawdź komunikat reconnect; po wznowieniu sesji powinien odzyskać to samo miejsce i prywatny snapshot.
+
+## Prywatność stanu
+
+Pełny stan zawierający talię, RNG, seed i wszystkie ręce jest dostępny tylko bieżącemu hostowi oraz przechowywany przez backend jako snapshot potrzebny do reconnect/zmiany hosta. Do innych klientów wysyłany jest wyłącznie widok wygenerowany przez `getPlayerView(state, seat)`.
+
+To nadal model host-authoritative do prywatnych gier. Docelowym kolejnym etapem, jeśli Puchate Café ma obsługiwać ranking lub niezaufane lobby publiczne, jest przeniesienie reduktora zasad do `qqnd-game-server`, analogicznie do aktualnego serwerowego silnika SKAT/Tichu.
