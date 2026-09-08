@@ -127,7 +127,7 @@
           <button class="back-button" type="button" data-action="back-home"><span data-icon="arrow-left" aria-hidden="true"></span> Wróć</button>
           <div class="panel-heading centered-heading">
             <span class="heading-icon heading-icon-mint" data-icon="people" aria-hidden="true"></span>
-            <div><p class="eyebrow">Prywatny stolik</p><h1 id="multiplayer-title">Graj razem, gdziekolwiek jesteście</h1><p>Utwórz pokój albo dołącz za pomocą sześcioliterowego kodu.</p></div>
+            <div><p class="eyebrow">Prywatny stolik</p><h1 id="multiplayer-title">Graj razem, gdziekolwiek jesteście</h1><p>Utwórz pokój albo dołącz za pomocą ośmioznakowego kodu.</p></div>
           </div>
           <div class="mode-grid">
             <form id="host-form" class="mode-card form-stack">
@@ -152,7 +152,7 @@
               <label for="join-name">Twoje imię</label>
               <input id="join-name" name="joinName" type="text" maxlength="20" placeholder="np. Maja" autocomplete="nickname" required>
               <label for="room-code">Kod pokoju</label>
-              <input id="room-code" class="code-input" name="roomCode" type="text" minlength="6" maxlength="6" inputmode="text" autocapitalize="characters" autocomplete="off" placeholder="KAWA12" required>
+              <input id="room-code" class="code-input" name="roomCode" type="text" minlength="8" maxlength="9" inputmode="text" autocapitalize="characters" autocomplete="off" placeholder="KAWA-2345" required>
               <button class="secondary-button blue-button full-width" type="submit"><span data-icon="arrow-right" aria-hidden="true"></span> Dołącz</button>
             </form>
           </div>
@@ -160,11 +160,11 @@
             <summary><span data-icon="shield" aria-hidden="true"></span> Ustawienia połączenia</summary>
             <div class="form-stack">
               <label for="signaling-url">Adres serwera pokoju <span class="optional-label">opcjonalnie</span></label>
-              <input id="signaling-url" name="signalingUrl" type="url" inputmode="url" placeholder="https://twoj-serwer.example.workers.dev" autocomplete="url">
+              <input id="signaling-url" name="signalingUrl" type="url" inputmode="url" placeholder="wss://api.qqnd.fyi/api/v1/ws" autocomplete="url">
               <p class="field-help">Potrzebny tylko do gry przez internet. Tryb z botami działa również bez serwera.</p>
             </div>
           </details>
-          <p class="privacy-note"><span data-icon="shield" aria-hidden="true"></span> Prywatne połączenie między graczami. Bez konta i rejestracji.</p>
+          <p class="privacy-note"><span data-icon="shield" aria-hidden="true"></span> Prywatny pokój przez wspólny serwer QQND. Bez konta i rejestracji.</p>
         </div>
       </section>
 
