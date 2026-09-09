@@ -7,6 +7,7 @@ import {
 } from './core.js';
 import { chooseBotAction } from './bots.js';
 import { MultiplayerSession } from './multiplayer.js';
+import { getMenuLanguage, peerNotice } from './online-ux.js';
 import {
   CARD_PRESENTATION,
   createCard,
@@ -631,7 +632,9 @@ function createOnlineSession(role) {
     },
     onError: showError,
     onPeerChange: (event) => {
-      if (event.status === 'disconnected') showToast('Gracz utracił połączenie. Gra została zatrzymana.', { type: 'error', duration: 6000 });
+      if (app.multiplayer?.inGame) app.mode = app.multiplayer.role === 'host' ? 'online-host' : 'online-guest';
+      const notice = peerNotice(event, getMenuLanguage());
+      if (notice) showToast(notice.message, { type: notice.type, duration: notice.duration });
     },
   });
   return app.multiplayer;
@@ -878,3 +881,6 @@ if (soundToggle) {
 updateVariantControls('classic', 'local');
 updateVariantControls('classic', 'host');
 setScreen('home');
+
+globalThis.__puchateApp = { app, createOnlineSession, goHome, setScreen, showToast, showError };
+void import('./menu-experience.js').catch(showError);
