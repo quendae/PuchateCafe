@@ -20,6 +20,6 @@ jobs:
           node-version: 22
       - run: npm run check
       - run: npm test
-      - run: node scripts/browser-smoke.mjs
       - run: npm run build
+      - run: node scripts/browser-smoke.mjs dist
 
