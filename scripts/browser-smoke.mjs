@@ -8,6 +8,10 @@ const smokePath = 'browser-smoke.html';
 const original = await readFile('index.html', 'utf8');
 const bootstrapScript = `<script>
 window.__bootstrapErrors = [];
+localStorage.setItem('puchate.qqnd.server-session.v1', JSON.stringify({
+  sessionId: '11111111-1111-4111-8111-111111111111',
+  resumeToken: 'r'.repeat(40),
+}));
 const recordBootstrapError = (event) => {
   const target = event.target && event.target !== window ? event.target : null;
   const resource = target ? (target.src || target.href || target.tagName || 'resource') : '';
@@ -25,15 +29,23 @@ window.addEventListener('unhandledrejection', (event) => {
 const probeScript = `<script>
 const reportSmoke = (status, detail = '') => fetch('/__smoke?status=' + encodeURIComponent(status) + '&detail=' + encodeURIComponent(detail)).catch(() => {});
 window.setTimeout(() => {
+  const errors = (window.__bootstrapErrors || []).join(' | ');
   const button = document.querySelector('[data-action="solo"]');
+  const language = document.getElementById('menu-language');
+  const resume = document.getElementById('resume-session-card');
+  const artCards = document.querySelectorAll('.hero-art-card img');
+  if (errors) { reportSmoke('fail', errors); return; }
   if (!button) { reportSmoke('fail', 'solo button missing'); return; }
+  if (!language) { reportSmoke('fail', 'menu language control missing'); return; }
+  if (!resume || resume.hidden) { reportSmoke('fail', 'saved-session continue card missing'); return; }
+  if (artCards.length < 3) { reportSmoke('fail', 'card-art hero did not render'); return; }
   button.click();
   window.setTimeout(() => {
     const setup = document.getElementById('setup-screen');
-    const errors = (window.__bootstrapErrors || []).join(' | ');
-    reportSmoke(setup && !setup.hidden ? 'ok' : 'fail', errors || 'setup screen stayed hidden after click');
+    const lateErrors = (window.__bootstrapErrors || []).join(' | ');
+    reportSmoke(setup && !setup.hidden ? 'ok' : 'fail', lateErrors || 'setup screen stayed hidden after click');
   }, 200);
-}, 800);
+}, 900);
 </script>`;
 const smokeHtml = original.replace(
   '<script type="module" src="src/app.js"></script>',
@@ -45,7 +57,7 @@ await writeFile(smokePath, smokeHtml, 'utf8');
 let resolveResult;
 const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
 const requests = [];
-const mimeTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+const mimeTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.webp': 'image/webp' };
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   if (url.pathname === '/__smoke') {
@@ -103,7 +115,7 @@ try {
     console.error('Browser request trace:\n' + requests.join('\n'));
     throw new Error(`Browser smoke failed: ${result.detail || 'unknown bootstrap failure'}`);
   }
-  console.log('Browser smoke OK: app bootstrapped and Solo menu button opened setup.');
+  console.log('Browser smoke OK: redesigned menu, saved-session affordance and Solo navigation all work.');
 } finally {
   chrome.kill('SIGKILL');
   await new Promise((resolve) => server.close(resolve));
