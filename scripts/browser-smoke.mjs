@@ -1,11 +1,13 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { readFile, stat, writeFile, unlink } from 'node:fs/promises';
-import { extname, join, normalize } from 'node:path';
+import { extname, join, normalize, resolve } from 'node:path';
 
 const port = 4197;
-const smokePath = 'browser-smoke.html';
-const original = await readFile('index.html', 'utf8');
+const rootDir = resolve(process.argv[2] ?? '.');
+const smokeFilename = 'browser-smoke.html';
+const smokePath = join(rootDir, smokeFilename);
+const original = await readFile(join(rootDir, 'index.html'), 'utf8');
 const bootstrapScript = `<script>
 window.__bootstrapErrors = [];
 localStorage.setItem('puchate.qqnd.server-session.v1', JSON.stringify({
@@ -42,6 +44,10 @@ window.setTimeout(() => {
   if (!language) { reportSmoke('fail', 'menu language control missing'); return; }
   if (!resume || resume.hidden) { reportSmoke('fail', 'saved-session continue card missing'); return; }
   if (artCards.length < 3) { reportSmoke('fail', 'card-art hero did not render'); return; }
+  if ([...artCards].some((image) => !image.complete || image.naturalWidth === 0)) {
+    reportSmoke('fail', 'one or more card-art images failed to load');
+    return;
+  }
   if (document.documentElement.scrollWidth > window.innerWidth + 2) {
     reportSmoke('fail', 'horizontal overflow: scrollWidth=' + document.documentElement.scrollWidth + ', viewport=' + window.innerWidth);
     return;
@@ -65,7 +71,7 @@ const smokeHtml = original.replace(
   '<script type="module" src="src/app.js"></script>',
   `${bootstrapScript}\n  <script type="module" src="src/app.js"></script>\n  ${probeScript}`,
 );
-if (smokeHtml === original) throw new Error('Could not inject browser smoke probe into index.html');
+if (smokeHtml === original) throw new Error(`Could not inject browser smoke probe into ${join(rootDir, 'index.html')}`);
 await writeFile(smokePath, smokeHtml, 'utf8');
 
 const pendingResults = new Map();
@@ -83,7 +89,7 @@ const server = createServer(async (request, response) => {
   }
   const requested = decodeURIComponent(url.pathname);
   const safePath = normalize(requested).replace(/^(\.\.[/\\])+/, '').replace(/^[/\\]+/, '');
-  let filePath = join(process.cwd(), safePath || 'index.html');
+  let filePath = join(rootDir, safePath || 'index.html');
   try {
     if ((await stat(filePath)).isDirectory()) filePath = join(filePath, 'index.html');
     const body = await readFile(filePath);
@@ -97,9 +103,9 @@ const server = createServer(async (request, response) => {
     response.end('Not found');
   }
 });
-await new Promise((resolve, reject) => {
+await new Promise((resolvePromise, reject) => {
   server.once('error', reject);
-  server.listen(port, '127.0.0.1', resolve);
+  server.listen(port, '127.0.0.1', resolvePromise);
 });
 
 const candidates = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
@@ -107,7 +113,7 @@ const chromeBinary = candidates.map((candidate) => spawnSync('which', [candidate
 if (!chromeBinary) throw new Error('Chromium/Chrome executable not found on CI runner');
 
 async function runViewport(name, width, height) {
-  const resultPromise = new Promise((resolve) => pendingResults.set(name, resolve));
+  const resultPromise = new Promise((resolvePromise) => pendingResults.set(name, resolvePromise));
   const chrome = spawn(chromeBinary, [
     '--headless=new',
     '--no-sandbox',
@@ -115,7 +121,7 @@ async function runViewport(name, width, height) {
     '--disable-dev-shm-usage',
     '--disable-background-networking',
     `--window-size=${width},${height}`,
-    `http://127.0.0.1:${port}/${smokePath}?run=${encodeURIComponent(name)}`,
+    `http://127.0.0.1:${port}/${smokeFilename}?run=${encodeURIComponent(name)}`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let chromeStderr = '';
   chrome.stderr.on('data', (chunk) => { chromeStderr += chunk.toString(); });
@@ -128,7 +134,7 @@ async function runViewport(name, width, height) {
       }),
     ]);
     if (result.status !== 'ok') throw new Error(`${name} browser smoke failed: ${result.detail || 'unknown bootstrap/layout failure'}`);
-    console.log(`Browser smoke OK (${name} ${width}x${height}).`);
+    console.log(`Browser smoke OK (${name} ${width}x${height}, root=${rootDir}).`);
   } finally {
     clearTimeout(timeout);
     pendingResults.delete(name);
@@ -139,11 +145,11 @@ async function runViewport(name, width, height) {
 try {
   await runViewport('desktop', 1440, 900);
   await runViewport('mobile', 390, 844);
-  console.log('Browser smoke OK: redesigned menu, saved-session affordance, responsive layout and Solo navigation all work.');
+  console.log('Browser smoke OK: redesigned menu, saved-session affordance, card assets, responsive layout and Solo navigation all work.');
 } catch (error) {
   console.error('Browser request trace:\n' + requests.join('\n'));
   throw error;
 } finally {
-  await new Promise((resolve) => server.close(resolve));
+  await new Promise((resolvePromise) => server.close(resolvePromise));
   await unlink(smokePath).catch(() => {});
 }
