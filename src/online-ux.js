@@ -47,11 +47,27 @@ export function setMenuLanguage(language, storage = undefined) {
   return normalized;
 }
 
+async function waitForRuntimeState(session, timeoutMs = 1600) {
+  if (!Number.isInteger(session?.lastRevision) || session.lastRevision >= 0) return;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (session.lastRevision >= 0 || !session.inGame) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 export async function resumeSavedOnlineGame(session) {
   if (!session || typeof session._resumeConnection !== 'function') throw new TypeError('resume-capable MultiplayerSession required');
   await session._resumeConnection();
-  const snapshot = session.snapshot ?? {};
+  let snapshot = session.snapshot ?? {};
   if (!snapshot.inGame || !snapshot.roomCode) return null;
+
+  // session.resumed contains the static lobby owner, while game.state carries
+  // the current runtime host after a host migration. Waiting briefly for the
+  // requested runtime state prevents a returning former host from being treated
+  // as host again for a frame or two.
+  await waitForRuntimeState(session);
+  snapshot = session.snapshot ?? snapshot;
   return {
     roomCode: snapshot.roomCode,
     localSeat: snapshot.localSeat,
